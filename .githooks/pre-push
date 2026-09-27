@@ -1,0 +1,19 @@
+#!/bin/bash
+# pre-push: bloqueia push direto em main (GitHub Flow enxuto — BRANCHING.md:5)
+# Repo private free não tem branch protection server-side (403 Pro required),
+# então a proteção é local. Libera com --no-verify em emergência.
+protected="main"
+blocked=0
+while read local_ref local_sha remote_ref remote_sha; do
+  branch=$(echo "$remote_ref" | sed 's|refs/heads/||')
+  if [ "$branch" = "$protected" ]; then
+    if echo "$local_ref" | grep -q "refs/tags/"; then continue; fi
+    if echo "$local_ref" | grep -q "refs/heads/$protected"; then
+      echo "⛔ Push direto em '$protected' bloqueado (BRANCHING.md:5)" >&2
+      echo "   Use: git checkout -b feat/X && git push -u origin feat/X -> PR squash" >&2
+      echo "   Emergência: git push --no-verify origin main" >&2
+      blocked=1
+    fi
+  fi
+done
+exit $blocked

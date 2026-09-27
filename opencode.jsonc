@@ -1,0 +1,31 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  // Projeto olx-deals — permissão mínima para garantir branching.
+  // Instruções textuais agora vivem em AGENTS.md (repo-native, agnóstico a ferramenta)
+  // que todo agente/humano lê. Este arquivo guarda só o enforcement opencode-específico.
+  // Após editar, reinicie o opencode: sessão atual mantém config antiga.
+  "instructions": ["AGENTS.md"],
+
+  // Impede agente de fazer push direto em main sem PR.
+  // Ordem importa: última regra que casa vence. Broad primeiro, específico por último.
+  "permission": {
+    "bash": {
+      // Permite tudo por padrão
+      "*": "allow",
+      // Bloqueia push direto em main (agente deve criar feat/* e abrir PR)
+      "git push origin main": "deny",
+      "git push origin main:main": "deny",
+      // --no-verify libera só com confirmação humana (emergência)
+      "git push --no-verify origin main": "ask",
+      "git push --no-verify*main": "ask"
+    }
+  },
+
+  // Herda MCP global; não precisa repetir.
+  "references": {
+    "branching": {
+      "path": "./BRANCHING.md",
+      "description": "Regras detalhadas de branching — ver AGENTS.md antes de criar branch"
+    }
+  }
+}

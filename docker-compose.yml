@@ -1,0 +1,37 @@
+# docker-compose.yml — serviço olx-gui standalone
+# Uso:
+#   docker compose up -d                # sobe só o olx-gui (porta 8765)
+#   docker compose logs -f olx-gui
+# Para integrar ao stack principal (ex.: /path/to/seu-stack/docker-compose.yml),
+# copie o bloco `olx-gui:` para dentro de `services:` daquele arquivo.
+
+services:
+  olx-gui:
+    build: .
+    image: olx-gui:local
+    container_name: olx-gui
+    restart: unless-stopped
+    ports:
+      - "8765:8765"  # host:container — acessível via http://<seu-host-lan>:8765
+    volumes:
+      # código (para hot-reload se editar templates) — opcional: pode remover e usar só a imagem
+      - ./templates:/app/templates:ro
+      - ./static:/app/static:ro
+      # estado persistente (mesmo que o CLI usa: ~/.olx/{config.json,cookies.json,deals.json,telegram.json})
+      # crie o dir no host e ajuste o path abaixo (ex.: ${HOME}/.olx:/root/.olx)
+      - ${HOME}/.olx:/root/.olx
+    environment:
+      - OLX_GUI_HOST=0.0.0.0
+      - OLX_GUI_PORT=8765
+      # auth opt-in para /api/*: só exige X-API-Token se o valor vier do host
+      - OLX_API_TOKEN=${OLX_API_TOKEN:-}
+      # opcional: Telegram via env (tem precedência sobre config.json)
+      # - OLX_TG_TOKEN=changeme
+      # - OLX_TG_CHAT_ID=changeme
+    # garante que o container entra na mesma rede do stack principal se quiser descoberta via nome
+    # networks:
+    #   - home-lab
+# networks:
+#   home-lab:
+#     external: true
+#     name: stack_default  # descubra com `docker network ls` (ex:  br-82919e056f03)

@@ -1,0 +1,59 @@
+name: branch-guard
+
+on:
+  pull_request:
+    branches: [main]
+
+# Nota: push direto em main não tem guarda server-side no Free private (403 Pro required)
+# A proteção é local via .githooks/pre-push (bloqueia) + core.hooksPath.
+# Este workflow valida PRs; push direto bypassa CI — por isso o hook local é essencial.
+# Se tornar o repo público ou assinar Pro, ative branch protection em Settings → Branches.
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verifica nome da branch (PR)
+        run: |
+          branch="${{ github.head_ref }}"
+          echo "Branch: $branch"
+          if ! echo "$branch" | grep -qE '^(feat|fix|chore|docs|exp|hotfix)/[a-z0-9][a-z0-9._-]*$'; then
+            echo "⛔ Branch '$branch' fora do padrão (BRANCHING.md:2)"
+            echo "Esperado: feat/9-lifecycle | fix/cloudflare-403 | chore/xyz | docs/xyz | exp/xyz | hotfix/xyz"
+            exit 1
+          fi
+          echo "✓ branch ok"
+
+      - name: Valida mensagens de commit (Conventional Commits)
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          echo "base=$base head=$head"
+          commits=$(git log --format=%s "$base..$head")
+          echo "$commits"
+          ok=1
+          while IFS= read -r msg; do
+            [ -z "$msg" ] && continue
+            if echo "$msg" | grep -qE "^Merge (branch|pull request)"; then continue; fi
+            if echo "$msg" | grep -qE "^Revert \""; then continue; fi
+            if ! echo "$msg" | grep -qE "^(feat|fix|chore|docs|test|build|refactor|perf|style|ci)(\(.+\))?: .{5,}"; then
+              echo "⛔ Commit inválido: $msg"
+              echo "Esperado: feat|fix|chore|docs|test|build|refactor|perf|style|ci(escopo): descrição"
+              ok=0
+            fi
+          done <<< "$commits"
+          if [ $ok -eq 0 ]; then exit 1; fi
+          echo "✓ commits ok"
+
+      - name: Verifica linear history (sem merge commits)
+        run: |
+          if git log --merges --oneline "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}" 2>/dev/null | grep -q .; then
+            echo "⛔ Merge commits detectados — use rebase (BRANCHING.md:7)"
+            git log --merges --oneline "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+            exit 1
+          fi
+          echo "✓ linear ok"

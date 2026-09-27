@@ -1,0 +1,25 @@
+#!/bin/bash
+# commit-msg: valida Conventional Commits (BRANCHING.md:2)
+# Permite: feat, fix, chore, docs, test, build, refactor, perf, style, ci
+# Formato: tipo(escopo opcional): descrição  — ex: feat(9): lifecycle status
+# Também permite Merge commits gerados por GitHub (squash disabled, mas garante)
+msg_file="$1"
+msg=$(head -n1 "$msg_file")
+
+# ignora merges e reverts
+if echo "$msg" | grep -qE "^Merge (branch|remote)"; then exit 0; fi
+if echo "$msg" | grep -qE "^Revert \""; then exit 0; fi
+
+# pattern: tipo(escopo)?: mensagem com >=5 chars
+if ! echo "$msg" | grep -qE "^(feat|fix|chore|docs|test|build|refactor|perf|style|ci)(\(.+\))?: .{5,}"; then
+  echo "⛔ Commit inválido (BRANCHING.md:2)" >&2
+  echo "   Esperado: tipo(escopo): descrição" >&2
+  echo "   Tipos: feat|fix|chore|docs|test|build|refactor|perf|style|ci" >&2
+  echo "   Ex: feat(9): lifecycle status active/removed" >&2
+  echo "   Ex: fix(api): corrige purge UI" >&2
+  echo "   Sua mensagem: $msg" >&2
+  echo "   Dica: git commit --amend -m \"feat: ...\"" >&2
+  echo "   Bypass emergência: git commit --no-verify" >&2
+  exit 1
+fi
+exit 0

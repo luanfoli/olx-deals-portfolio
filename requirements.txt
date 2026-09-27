@@ -1,0 +1,11 @@
+playwright
+curl_cffi
+beautifulsoup4
+Flask
+APScheduler
+croniter
+pytest
+PyYAML
+fastmcp==3.4.7
+httpx==0.28.1
+openai>=1.30

@@ -1,0 +1,26 @@
+#!/bin/bash
+# pre-commit: valida nome da branch (BRANCHING.md:2)
+# Bloqueia commit direto em main e exige padrão feat/fix/chore/docs/exp/hotfix
+branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+
+# permite commit em detached HEAD (rebase) e em tags
+if [ "$branch" = "HEAD" ]; then exit 0; fi
+
+if [ "$branch" = "main" ]; then
+  echo "⛔ Commit direto em 'main' bloqueado (BRANCHING.md:3)" >&2
+  echo "   Crie branch: git checkout -b feat/12-tuner-ia" >&2
+  echo "   Ou para docs rápido: git commit --no-verify" >&2
+  exit 1
+fi
+
+# padrão: tipo/slug  — tipo = feat|fix|chore|docs|exp|hotfix, slug = [a-z0-9-]
+if ! echo "$branch" | grep -qE "^(feat|fix|chore|docs|exp|hotfix)/[a-z0-9][a-z0-9._-]*$"; then
+  # permite branch de teste chore/branching-* que já usamos
+  # mas bloqueia nomes como "minha-branch" ou "teste"
+  echo "⚠️  Branch '$branch' fora do padrão (BRANCHING.md:2)" >&2
+  echo "   Esperado: feat/9-lifecycle | fix/cloudflare-403 | chore/xyz | docs/xyz | exp/xyz | hotfix/xyz" >&2
+  echo "   Slug: minúsculas, a-z0-9, hífen, ponto, underscore" >&2
+  echo "   Para forçar: git commit --no-verify" >&2
+  exit 1
+fi
+exit 0

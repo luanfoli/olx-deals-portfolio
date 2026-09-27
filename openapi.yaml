@@ -1,0 +1,2451 @@
+openapi: 3.0.3
+info:
+  title: olx-deals API
+  version: 2.0.0
+  description: |
+    API REST do olx-deals: monitora buscas na OLX por produtos configurados,
+    filtra ofertas (preço, junk, exclude_keywords), salva histórico e
+    notifica via Telegram.
+
+    ## Como ler esta spec (para agentes)
+    - `Product` é a unidade central: cada produto tem queries OLX, filtros de
+      preço (valores absolutos em BRL — NÃO use R$/TB) e agendamento próprio.
+    - Para criar/alterar monitoramentos, prefira o CRUD de products
+      (`createProduct`/`updateProduct`/`deleteProduct`). **Evite `putConfig`**:
+      ele substitui a lista inteira de products de uma vez.
+    - `triggerScrape` é síncrono-lento: pode levar minutos (Playwright,
+      anti-bot). Fluxo recomendado: chame `triggerScrape`, depois faça polling
+      de `getScrapeStatus` até `running=false`.
+    - Ofertas ficam em `getDeals`. O campo derivado `matched=true` significa
+      que o anúncio passou pelos filtros do produto; `notified=true` que já
+      foi enviado ao Telegram.
+    - Erros sempre vêm como JSON `{"ok": false, "error": "..."}` ou
+      `{"ok": false, "errors": ["..."]}` (validação, lista com um item por erro).
+servers:
+  - url: http://127.0.0.1:8765
+    description: Bind padrão local
+
+security:
+  - ApiKeyHeader: []
+
+paths:
+  /api/health:
+    get:
+      operationId: getHealth
+      summary: Liveness probe
+      description: |
+        Healthcheck barato. Sempre aberto, mesmo com auth por token habilitada
+        (usado por proxy/container). Não toca em estado nenhum.
+      security: []
+      tags: [System]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+                  time:
+                    type: string
+                    format: date-time
+                required: [ok, time]
+
+  /api/config/telegram/test:
+    post:
+      operationId: testTelegram
+      summary: Envia mensagem de teste ao Telegram
+      description: |
+        Envia "✓ Teste olx-deals..." para o chat configurado. Usa `token` e
+        `chat_id` do body se fornecidos; senão usa os salvos na config.
+        Falha com 400 se não houver token/chat_id em nenhum dos lugares.
+      tags: [System]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                token:
+                  type: string
+                  description: Bot token; omitir para usar o da config salva.
+                chat_id:
+                  oneOf:
+                    - type: string
+                    - type: integer
+                  description: Chat ID; omitir para usar o da config salva.
+      responses:
+        "200":
+          description: Mensagem enviada
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimpleOk"
+        "400":
+          description: Token/chat_id ausentes (nem no body nem na config)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "502":
+          description: Telegram respondeu com erro HTTP
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ErrorEnvelope"
+                  - type: object
+                    properties:
+                      body:
+                        type: string
+                        description: Primeiros 500 chars da resposta do Telegram.
+        "500":
+          description: Exceção ao contatar o Telegram
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /api/config:
+    get:
+      operationId: getConfig
+      summary: Lê config global
+      description: |
+        Retorna a config completa persistida (`~/.olx/config.json`):
+        lista de products, credenciais Telegram (token pode vir exposto)
+        e `notify_price_change_pct` (% de |Δpreço| para re-notificar deal já
+        notificado; default 5).
+      tags: [Config]
+      responses:
+        "200":
+          description: Config atual
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Config"
+    put:
+      operationId: putConfig
+      summary: Substitui a config global (DESTRUTIVO para products)
+      description: |
+        ⚠️ Se o body contiver `products`, a lista INTEIRA é substituída pela
+        enviada — produtos não incluídos são apagados. Prefira fortemente o
+        CRUD de products (`POST/PUT/DELETE /api/products`) para alterar
+        monitoramentos individuais.
+
+        Campos aceitos fora de `products`: `telegram_token`,
+        `telegram_chat_id` (string numérica é convertida para int),
+        `notify_price_change_pct` (0–100). Omitidos permanecem como estão.
+        Re-agenda os jobs APScheduler após salvar.
+      tags: [Config]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ConfigPatch"
+      responses:
+        "200":
+          description: Config salva
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  config:
+                    $ref: "#/components/schemas/Config"
+                required: [ok, config]
+        "400":
+          description: Erros de validação (um item por problema, prefixado com índice em products[N])
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /api/products:
+    get:
+      operationId: listProducts
+      summary: Lista todos os produtos
+      tags: [Products]
+      responses:
+        "200":
+          description: Lista de produtos normalizados
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  products:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Product"
+                required: [products]
+    post:
+      operationId: createProduct
+      summary: Cria um produto
+      description: |
+        Cria novo monitoramento. Regras:
+        - `name` obrigatório (max 80 chars); `queries` obrigatório (lista não
+          vazia, max 50 termos, cada termo max 80 chars).
+        - `id` é opcional e SLUGIFICADO (minúsculas, só a-z0-9 e hífen);
+          se omitido, deriva do name. Responde **409** se o id final já existir.
+        - `pages` 1–10 (default 2); `min_price`/`max_price` são valores
+          absolutos em BRL (ex.: 900 = R$ 900,00; NÃO use preço por TB),
+          0 < valor ≤ 1000000, min < max.
+        - `exclude_keywords` (max 50 termos, 40 chars cada): regex/trechos
+          aplicados ao título pós-coleta; lista vazia é válida.
+        - Máximo de 100 produtos no total (limite do save_config).
+        - Campos desconhecidos são descartados; defaults preenchidos na
+          resposta (`search_url` padrão OLX, `junk_pattern` default etc.).
+      tags: [Products]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProductCreate"
+            examples:
+              basico:
+                summary: HD 8TB até R$ 600
+                value:
+                  name: HD 8TB
+                  queries: ["hd 8tb", "hd800gb"]
+                  max_price: 600
+                  pages: 2
+      responses:
+        "201":
+          description: Criado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  product:
+                    $ref: "#/components/schemas/Product"
+                  config:
+                    $ref: "#/components/schemas/Config"
+                required: [ok, product, config]
+        "400":
+          description: Erros de validação
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "409":
+          description: id duplicado após slugificação
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /api/products/{pid}:
+    parameters:
+      - $ref: "#/components/parameters/ProductId"
+    get:
+      operationId: getProduct
+      summary: Busca um produto por id
+      tags: [Products]
+      responses:
+        "200":
+          description: Produto encontrado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  product:
+                    $ref: "#/components/schemas/Product"
+                required: [ok, product]
+        "404":
+          description: Produto inexistente (id é case-sensitive aqui; ids são slugs minúsculos)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+    put:
+      operationId: updateProduct
+      summary: Atualiza parcialmente um produto
+      description: |
+        Merge raso: só os campos enviados são alterados; o restante preservado.
+        `id` pode ser alterado (será slugificado; 409 se colidir com outro).
+        Mesmas validações/faixas do createProduct aplicadas aos campos presentes.
+        Re-agenda o job APScheduler do produto após salvar.
+      tags: [Products]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProductUpdate"
+      responses:
+        "200":
+          description: Atualizado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  product:
+                    $ref: "#/components/schemas/Product"
+                  config:
+                    $ref: "#/components/schemas/Config"
+                required: [ok, product, config]
+        "400":
+          description: Erros de validação
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "404":
+          description: Produto inexistente
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "409":
+          description: Novo id colide com produto existente
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+    delete:
+      operationId: deleteProduct
+      summary: Remove um produto
+      description: |
+        Remove o produto da config e re-agenda o scheduler.
+        **Não permite remover o último produto** — desative-o com
+        `updateProduct {enabled:false}` em vez disso (400).
+      tags: [Products]
+      responses:
+        "200":
+          description: Removido
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  config:
+                    $ref: "#/components/schemas/Config"
+                required: [ok, config]
+        "400":
+          description: É o último produto (remoção proibida)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "404":
+          description: Produto inexistente
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /api/deals:
+    get:
+      operationId: getDeals
+      summary: Lista deals salvos (histórico filtrável)
+      description: |
+        Histórico completo de anúncios coletados (desde item 8, inclui também descartados por preço com discard_reason), com campo derivado
+        `notified` (true = chave `product_id:id` presente no registro de
+        notificações) e `discard_reason` quando matched=false. Filtros combináveis por query string:
+        - `matched_only=1`: só anúncios que passaram nos filtros do produto
+          (preço/junk/exclude/dedupe). Ofertas antigas sem discard_reason continuam como match.
+        - `q`: substring case-insensitive sobre título+url+ids.
+        - `product_id`: restringe a um produto (ou `all`).
+        - `notified=0|1`: só não-notificados / só notificados.
+        - `price_min`/`price_max`: filtro ad-hoc inclusivo por faixa de preço (BRL, 0<valor≤1e6, min<max quando ambos). Só casam deals com price; sem preço nunca casam quando filtro ativo. Combinável com matched_only e demais filtros, atua apenas sobre view.
+        - `sort`: price|fetched_at|title|product (legados price_per_tb/tb
+          mapeiam para price); `order`: asc|desc (default desc).
+        - `limit`/`offset`: paginação aplicada APÓS ordenação; `total` é o
+          count pré-paginação, `count` o retornado.
+        - `re-evaluate=1` / `re_evaluate=1` / `view=current`: reaplica filtros vigentes (config.json) sobre title/price e expõe matched_current/discard_reason_current sem persistir; combinável com adherent=0|1 e matched_only (que passa a filtrar matched_current quando re-evaluate sem adherent, ou matched histórico quando adherent presente).
+        - `status=active|removed|all` (ou removed=0|1): filtra por lifecycle quando #9 entregue; default all.
+      tags: [Deals]
+      parameters:
+        - name: matched_only
+          in: query
+          schema: { type: string, enum: ["1", "true", "yes"] }
+          description: Só deals com matched=true. Ofertas legadas sem discard_reason são tratadas como matched. Quando re-evaluate=1 e adherent ausente, filtra matched_current.
+        - name: q
+          in: query
+          schema: { type: string }
+          description: Busca substring case-insensitive em título/url/id/product.
+        - name: product_id
+          in: query
+          schema: { type: string }
+          description: Filtra por produto específico ("all" ignora).
+        - name: notified
+          in: query
+          schema: { type: string, enum: ["0", "1"] }
+          description: "0 = só não notificados; 1 = só notificados."
+        - name: price_min
+          in: query
+          schema: { type: number, minimum: 0, maximum: 1000000 }
+          description: Filtro ad-hoc inclusivo; só casam deals com price (anúncios sem preço nunca casam quando filtro ativo). Combinável com matched_only.
+        - name: price_max
+          in: query
+          schema: { type: number, minimum: 0, maximum: 1000000 }
+          description: Idem; price_min < price_max quando ambos presentes (400 se inválido).
+        - name: re-evaluate
+          in: query
+          schema: { type: string, enum: ["1", "true", "yes"] }
+          description: Quando 1, reaplica filtros vigentes sobre title/price e expõe matched_current/discard_reason_current sem persistir.
+        - name: re_evaluate
+          in: query
+          schema: { type: string, enum: ["1", "true", "yes"] }
+          description: Alias de re-evaluate.
+        - name: view
+          in: query
+          schema: { type: string, enum: [ingested, current] }
+          description: Alias; view=current equivale a re-evaluate=1, ingested (default) é histórico.
+        - name: adherent
+          in: query
+          schema: { type: string, enum: ["0", "1"] }
+          description: Só com re-evaluate=1. 0 = só não-aderentes (matched_current=false), 1 = só aderentes. Combinável com matched_only (que passa a filtrar matched histórico quando adherent presente).
+        - name: status
+          in: query
+          schema: { type: string, enum: [active, removed, all] }
+          description: Filtra por lifecycle; default all. Legados sem status são active.
+        - name: removed
+          in: query
+          schema: { type: string, enum: ["0", "1"] }
+          description: Alias de status (0=active,1=removed).
+        - name: sort
+          in: query
+          schema: { type: string, enum: [price, fetched_at, title, product, price_per_tb, tb] }
+          description: Campo de ordenação (default fetched_at).
+        - name: order
+          in: query
+          schema: { type: string, enum: [asc, desc] }
+          description: Direção (default desc).
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 0 }
+          description: Máximo de itens retornados.
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0 }
+          description: Itens a pular.
+      responses:
+        "200":
+          description: Lista paginada
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total:
+                    type: integer
+                    description: Total após filtros, antes de limit/offset.
+                  count:
+                    type: integer
+                    description: Itens nesta página.
+                  deals:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Deal"
+                required: [total, count, deals]
+
+  /api/deals/raw:
+    get:
+      operationId: getRawDeals
+      summary: Histórico bruto (sem filtros, sem notified)
+      description: |
+        Dump direto do arquivo de histórico (`deals.json`) como array JSON.
+        Sem paginação/filtros e SEM o campo derivado `notified`.
+        Deals antigos migrados ganham `product_id="hd-6-12tb"`.
+      tags: [Deals]
+      responses:
+        "200":
+          description: Array de deals
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Deal"
+
+  /api/deals/purge:
+    post:
+      operationId: purgeDeals
+      summary: Preview ou execução de expurgo auditável
+      description: |
+        Remove de deals.json ofertas não-aderentes/órfãs/removidas com backup e confirmação.
+        - `dry_run=true` retorna contadores sem modificar `deals.json`/`notified.json`/`runs.json`.
+        - Execução exige `confirm=true` e, para órfãos, `include_orphans=true` ou `product_ids` com ids órfãos explícitos.
+        Antes de escrever, cria `deals.json.bak-purge-<ISO>` e persiste via tmp+replace.
+        Nunca remove `notified.json` (informa `notified_entries_affected`).
+        Filtros combináveis: `product_ids`, `reasons` (orphan, include, junk, exclude, price, exclude:<term>), `status` (active|removed|all), `older_than` (ISO), `adherent`.
+      tags: [Deals]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                dry_run:
+                  type: boolean
+                  description: Preview sem alterar disco
+                confirm:
+                  type: boolean
+                  description: Obrigatório para execução real
+                product_ids:
+                  type: array
+                  items: { type: string }
+                  description: Restringe a pids; órfãos exigem lista explícita ou include_orphans
+                reasons:
+                  type: array
+                  items: { type: string }
+                  description: "Filtra por discard_reason_current; ex.: orphan, include, exclude:wii u"
+                status:
+                  type: string
+                  enum: [active, removed, all]
+                include_orphans:
+                  type: boolean
+                older_than:
+                  type: string
+                  format: date-time
+                adherent:
+                  type: string
+                  enum: ["0", "1"]
+      responses:
+        "200":
+          description: Preview ou execução
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  dry_run: { type: boolean }
+                  total_candidates: { type: integer }
+                  purged: { type: integer }
+                  remaining: { type: integer }
+                  backup_path: { type: string, nullable: true }
+                  by_product: { type: object, additionalProperties: { type: integer } }
+                  by_reason: { type: object, additionalProperties: { type: integer } }
+                  notified_entries_affected: { type: integer }
+                  candidates: { type: array, items: { $ref: '#/components/schemas/Deal' } }
+                  preview_truncated: { type: boolean }
+        "400":
+          description: Validação (confirm ausente, older_than inválido etc.)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "409":
+          description: Job em andamento
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /api/deals/renotify:
+    post:
+      operationId: renotifyDeals
+      summary: Reenvia um deal ao Telegram
+      description: |
+        Remove a chave do registro de notificados e envia o deal imediatamente.
+        Body aceita `{"product_id": "...", "ad_id": "..."}` ou `{"key":
+        "product_id:ad_id"}` (key tem precedência). Se o envio falhar, a chave
+        fica fora do registro → será re-tentada no próximo scrape.
+        `counters` espelha o retorno de notify: enviados/pulados/re_notificados/erro.
+      tags: [Deals]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                key:
+                  type: string
+                  example: "hd-6-12tb:2583917482"
+                  description: Chave completa product_id:ad_id.
+                product_id:
+                  type: string
+                ad_id:
+                  type: string
+                  description: Também aceito como `id`.
+      responses:
+        "200":
+          description: Processado (removed indica se a chave estava registrada)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  key:
+                    type: string
+                  removed:
+                    type: integer
+                    description: 1 se a chave foi removida do registro, 0 caso contrário.
+                  counters:
+                    type: object
+                    additionalProperties: true
+                required: [ok, key, removed, counters]
+        "400":
+          description: Nem key nem product_id+ad_id informados
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "404":
+          description: Deal não encontrado no histórico
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /api/notified:
+    get:
+      operationId: listNotified
+      summary: Metadados do registro de notificações
+      description: Retorna contagem e caminho do `notified.json` (não lista as chaves).
+      tags: [Deals]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  count:
+                    type: integer
+                  file:
+                    type: string
+                required: [ok, count, file]
+        "500":
+          description: Falha ao ler o registro
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+    delete:
+      operationId: clearNotified
+      summary: Limpa TODO o registro de notificações (DESTRUTIVO)
+      description: |
+        Apaga todas as entradas de `notified.json`. Efeito colateral importante:
+        no próximo scrape, TODO deal ainda vivo no histórico será re-notificado
+        ao Telegram (nenhum está mais marcado como enviado). Retenção automática
+        de 90 dias é aplicada separadamente pelo app.
+      tags: [Deals]
+      responses:
+        "200":
+          description: Registro limpo
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  cleared:
+                    type: integer
+                    description: Quantidade de entradas removidas.
+                required: [ok, cleared]
+        "500":
+          description: Falha ao escrever o registro
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /api/scrape:
+    post:
+      operationId: triggerScrape
+      summary: Dispara busca (scrape) agora
+      description: |
+        Inicia scrape assíncrono (thread em background) e retorna imediatamente.
+        Pode levar MINUTOS (curl→Playwright fallback, sleeps anti-bot entre
+        páginas). **Fluxo recomendado:** dispare aqui e faça polling de
+        `getScrapeStatus` até `running=false`; depois leia `getDeals`.
+
+        Body (todos opcionais):
+        - `product_ids`: lista de ids; ausente = todos os produtos habilitados.
+        - `playwright_only`: força Playwright para todos.
+        - `queue: true` (ou query `?queue=1`): enfileira se já houver scrape
+          rodando em vez de receber 409 (resposta 202 com `position`).
+        - `queries` no body é REJEITADO (400): queries vivem em Product.
+
+        Ao terminar, resultados novos são salvos no histórico e notificados
+        automaticamente no Telegram.
+      tags: [Scrape]
+      parameters:
+        - name: queue
+          in: query
+          schema: { type: string, enum: ["1", "true", "yes"] }
+          description: Enfileira se ocupado em vez de 409.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                product_ids:
+                  type: array
+                  items:
+                    type: string
+                  description: Ids de produtos a buscar; strings únicas viram lista.
+                playwright_only:
+                  type: boolean
+                  description: Força Playwright (ignora curl) neste run.
+                queue:
+                  type: boolean
+                  description: Sinônimo de ?queue=1.
+                enqueue:
+                  type: boolean
+                  description: Sinônimo de ?queue=1.
+                source:
+                  type: string
+                  description: Marcador de origem (manual/schedule); só aparece nos logs/status.
+      responses:
+        "200":
+          description: Scrape iniciado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  job:
+                    $ref: "#/components/schemas/ScrapeJobStub"
+                required: [ok, job]
+        "202":
+          description: Enfileirado (scrape já em andamento)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  queued:
+                    type: boolean
+                  position:
+                    type: integer
+                    description: Posição na fila (1-indexed).
+                  params:
+                    type: object
+                    additionalProperties: true
+                  queue_length:
+                    type: integer
+                required: [ok, queued, position]
+        "400":
+          description: Body continha `queries` (campo proibido)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "409":
+          description: Já há scrape em andamento (use ?queue=1)
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ErrorEnvelope"
+                  - type: object
+                    properties:
+                      job:
+                        $ref: "#/components/schemas/ScrapeJob"
+                      hint:
+                        type: string
+
+  /api/scrape/status:
+    get:
+      operationId: getScrapeStatus
+      summary: Estado do job de scrape
+      description: |
+        Snapshot do job atual/último: `running`, timestamps ISO UTC, contadores
+        (`results_count`, `matched_count`), `progress` (produto/query/página
+        correntes), `error` e `logs` (buffer das últimas ~800 linhas do run).
+        Use `?logs=0` para omitir logs (polling leve). Após terminar
+        (`running=false`), `finished_at` é preenchido e `logs` mantém o run.
+      tags: [Scrape]
+      parameters:
+        - name: logs
+          in: query
+          schema: { type: string, enum: ["0"] }
+          description: "0 = omite o array logs."
+      responses:
+        "200":
+          description: Estado do job
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ScrapeJob"
+
+  /api/scrape/logs:
+    get:
+      operationId: getScrapeLogs
+      summary: Logs incrementais do job
+      description: |
+        Linhas de log do run atual. `since=N` retorna apenas linhas do índice N
+        em diante (para polling incremental: guarde `total` e passe como since
+        na próxima chamada). Resposta traz `total`, `since` efetivo e `logs`.
+      tags: [Scrape]
+      parameters:
+        - name: since
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+          description: Índice inicial (default 0).
+      responses:
+        "200":
+          description: Logs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total:
+                    type: integer
+                  since:
+                    type: integer
+                  logs:
+                    type: array
+                    items:
+                      type: string
+                required: [total, since, logs]
+
+  /api/login:
+    post:
+      operationId: olxLogin
+      summary: Renova cookies anti-bot (headless Chromium)
+      description: |
+        Abre Chromium headless (Playwright) numa busca OLX para resolver o
+        Cloudflare e salvar cookies em `~/.olx/cookies.json`. Assíncrono:
+        acompanhe por `getScrapeStatus` (o login ocupa o mesmo slot de job).
+        Falha 409 se scrape/login já rodando. Útil quando os scrapes começam a
+        retornar 0 cards via curl (confira `getCookiesStatus`).
+      tags: [Scrape]
+      responses:
+        "200":
+          description: Login iniciado (verifique resultado via getScrapeStatus)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimpleOk"
+        "409":
+          description: Job em andamento
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /api/cookies/status:
+    get:
+      operationId: getCookiesStatus
+      summary: Estado do cookie jar anti-bot
+      description: |
+        Informações do arquivo de cookies Playwright: `exists`, `path`, e se
+        existirem: `mtime` (ISO UTC), `age_minutes`, `cookies_count`,
+        `cf_bm_expires` (epoch do cookie Cloudflare `__cf_bm` — expirado
+        sugere rodar `olxLogin`) e `size_bytes`. Em erro de leitura retorna
+        `error` no lugar dos campos.
+      tags: [Scrape]
+      responses:
+        "200":
+          description: Estado dos cookies
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CookiesStatus"
+
+  /api/runs:
+    get:
+      operationId: listRuns
+      summary: Lista histórico de execuções (sumário Tier 1)
+      description: |
+        Lista registros de runs persistidos em `runs.json` com paginação e filtros.
+        Filtros: `product_id` (aparece em product_ids_scraped/requested), `status` (ok|error),
+        `source` (manual|schedule|trigger|api), `since`/`until` (ISO UTC sobre started_at),
+        `sort` (started_at|duration) e `order` (asc|desc). Paginação via `limit` (1-200, default 50)
+        e `offset`. Ordenação padrão `started_at desc`. Retorna `total` pré-paginação e `count`.
+      tags: [Runs]
+      parameters:
+        - name: product_id
+          in: query
+          schema: { type: string }
+          description: Filtra runs onde product aparece (scraped ou requested). "all" ignora.
+        - name: status
+          in: query
+          schema: { type: string, enum: [ok, error] }
+          description: Só ok ou só erro.
+        - name: source
+          in: query
+          schema: { type: string }
+          description: "Filtra por origem (manual|schedule|trigger|api)."
+        - name: since
+          in: query
+          schema: { type: string, format: date-time }
+          description: started_at >= since (ISO UTC).
+        - name: until
+          in: query
+          schema: { type: string, format: date-time }
+          description: started_at <= until (ISO UTC).
+        - name: sort
+          in: query
+          schema: { type: string, enum: [started_at, duration, duration_ms] }
+          description: Campo de ordenação (default started_at).
+        - name: order
+          in: query
+          schema: { type: string, enum: [asc, desc] }
+          description: Direção (default desc).
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200 }
+          description: Máximo de itens retornados (default 50, max 200).
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0 }
+          description: Itens a pular.
+      responses:
+        "200":
+          description: Lista paginada
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total:
+                    type: integer
+                    description: Total após filtros, antes de limit/offset.
+                  count:
+                    type: integer
+                    description: Itens nesta página.
+                  runs:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Run"
+                required: [total, count, runs]
+        "400":
+          description: Parâmetro inválido
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+    delete:
+      operationId: clearRuns
+      summary: Limpa histórico por período/filtro
+      description: |
+        Remove runs que casam com todos os filtros fornecidos. Pelo menos um de
+        `before`, `product_id`, `status` ou `source` é obrigatório (400 se nenhum).
+        `before` remove `started_at < before` (ISO UTC). `product_id` só runs que contenham o produto.
+        Retorna `{"cleared": n}`. Retenção automática de 90d/1000 registros ocorre em toda escrita.
+      tags: [Runs]
+      parameters:
+        - name: before
+          in: query
+          schema: { type: string, format: date-time }
+          description: Remove runs com started_at < before (ISO UTC).
+        - name: product_id
+          in: query
+          schema: { type: string }
+          description: Só runs que contenham o produto.
+        - name: status
+          in: query
+          schema: { type: string, enum: [ok, error] }
+        - name: source
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Removidos
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  cleared:
+                    type: integer
+                required: [ok, cleared]
+        "400":
+          description: Nenhum filtro informado ou parâmetro inválido
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /api/runs/{id}:
+    get:
+      operationId: getRun
+      summary: Busca run por id
+      tags: [Runs]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+          description: "Id da execucao (ex. 20260827T143015-3f9a1c2e)."
+      responses:
+        "200":
+          description: Run encontrado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  run:
+                    $ref: "#/components/schemas/Run"
+                required: [ok, run]
+        "404":
+          description: Run não encontrado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+    delete:
+      operationId: deleteRun
+      summary: Remove um run específico
+      tags: [Runs]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Removido
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  cleared:
+                    type: integer
+                required: [ok, cleared]
+        "404":
+          description: Run não encontrado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /api/schedules/status:
+    get:
+      operationId: getSchedulesStatus
+      summary: Estado do scheduler e agendamentos por produto
+      description: |
+        Visão consolidada: `scheduler_running`/`has_scheduler` (APScheduler),
+        fila pendente (`queue`/`queue_length`), job em execução (`job`) e um
+        array `schedules` por produto com `enabled`, `mode`
+        (interval|cron), `interval_minutes` (15–10080), `cron`, `jitter_minutes`
+        (0–60), `timezone` (fixo America/Sao_Paulo), `next_run`, `last_run`
+        (ISO UTC), `last_status` (ok|error), `last_error`, `last_matched`,
+        `last_results` e `product_enabled` (schedule de produto desabilitado
+        não dispara). `last_run`/`last_status` são derivados de `runs.json` quando existir,
+        com fallback para `schedules.json` (compat pré-7a).
+      tags: [Schedules]
+      responses:
+        "200":
+          description: Estado dos agendamentos
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  scheduler_running:
+                    type: boolean
+                  has_scheduler:
+                    type: boolean
+                  queue:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+                  queue_length:
+                    type: integer
+                  job:
+                    type: object
+                    properties:
+                      running:
+                        type: boolean
+                      params:
+                        type: object
+                        additionalProperties: true
+                  schedules:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ScheduleStatus"
+                required: [ok, schedules]
+
+  /api/schedules/trigger/{pid}:
+    post:
+      operationId: triggerScheduleById
+      summary: Dispara imediatamente o scrape agendado de um produto
+      description: |
+        Igual a `triggerScrape` restrito a um produto (source=trigger).
+        404 se produto não existe. Se job ocupado: 409, ou 202 com `position`
+        usando `?queue=1` / body `{queue:true}`. Síncrono-lento — poll em
+        `getScrapeStatus`.
+      tags: [Schedules]
+      parameters:
+        - $ref: "#/components/parameters/ProductId"
+        - name: queue
+          in: query
+          schema: { type: string, enum: ["1", "true", "yes"] }
+          description: Enfileira se ocupado em vez de 409.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                queue:
+                  type: boolean
+                enqueue:
+                  type: boolean
+                playwright_only:
+                  type: boolean
+      responses:
+        "200":
+          description: Disparado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  job:
+                    $ref: "#/components/schemas/ScrapeJobStub"
+                required: [ok, job]
+        "202":
+          description: Enfileirado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  queued:
+                    type: boolean
+                  position:
+                    type: integer
+                  params:
+                    type: object
+                    additionalProperties: true
+                required: [ok, queued, position]
+        "404":
+          description: Produto inexistente
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "409":
+          description: Job em andamento (dica no hint)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /api/schedules/queue:
+    get:
+      operationId: getScheduleQueue
+      summary: Inspeciona a fila de scrapes pendentes
+      description: |
+        Itens enfileirados aguardando o job atual terminar (cada item carrega
+        `product_ids` e `source`). A fila drena automaticamente, um por vez,
+        quando o scrape corrente termina.
+      tags: [Schedules]
+      responses:
+        "200":
+          description: Fila atual
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  queue:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+                  length:
+                    type: integer
+                required: [ok, queue, length]
+    delete:
+      operationId: clearScheduleQueue
+      summary: Descarta toda a fila pendente (não afeta o job em execução)
+      tags: [Schedules]
+      responses:
+        "200":
+          description: Fila limpa
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  cleared:
+                    type: integer
+                required: [ok, cleared]
+
+  /api/schedules/run:
+    post:
+      operationId: runDueSchedules
+      summary: Alias de disparo manual (estilo schedules)
+      description: |
+        Dispara scrape imediato para `product_ids` (ou todos habilitados se
+        ausentes), com `source=trigger`. Mesma semântica de `triggerScrape`:
+        202 enfileirado com `?queue=1`/body `{queue:true}` quando ocupado,
+        senão 409. Corpo adicional: `playwright_only`, `source`.
+      tags: [Schedules]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                product_ids:
+                  type: array
+                  items:
+                    type: string
+                product_id:
+                  type: string
+                  description: Singular legado; convertido para lista.
+                playwright_only:
+                  type: boolean
+                source:
+                  type: string
+                  default: trigger
+                queue:
+                  type: boolean
+                enqueue:
+                  type: boolean
+      responses:
+        "200":
+          description: Disparado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  job:
+                    $ref: "#/components/schemas/ScrapeJobStub"
+                required: [ok, job]
+        "202":
+          description: Enfileirado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  queued:
+                    type: boolean
+                  position:
+                    type: integer
+                  params:
+                    type: object
+                    additionalProperties: true
+                required: [ok, queued, position]
+        "409":
+          description: Job em andamento
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /api/openapi.yaml:
+    get:
+      operationId: getOpenapiSpec
+      summary: Esta spec (OpenAPI 3.0.3)
+      description: |
+        Serve o documento OpenAPI que você está lendo. Fica sob o gate de auth
+        quando habilitado (leitura pelo MCP continua funcionando desde que ele
+        envie X-API-Token).
+      tags: [System]
+      responses:
+        "200":
+          description: Documento YAML
+          content:
+            application/yaml:
+              schema:
+                type: string
+
+  /api/tuner/requests:
+    get:
+      operationId: listTunerRequests
+      summary: Lista pedidos de cadastro assistido (tuner)
+      tags: [Tuner]
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string, enum: [pendente, em_refinamento, aguardando_aprovacao, ativado, descartado, all] }
+          description: Filtra por estado.
+        - name: q
+          in: query
+          schema: { type: string }
+          description: Busca em descricao/definicao/id/draft_product_id.
+        - name: sort
+          in: query
+          schema: { type: string, enum: [created_at, updated_at, status] }
+        - name: order
+          in: query
+          schema: { type: string, enum: [asc, desc] }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0 }
+      responses:
+        "200":
+          description: Lista paginada
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total: { type: integer }
+                  count: { type: integer }
+                  requests:
+                    type: array
+                    items: { $ref: '#/components/schemas/TunerRequest' }
+                required: [total, count, requests]
+    post:
+      operationId: createTunerRequest
+      summary: Cria pedido de cadastro assistido (cria draft desabilitado e inicia refinamento)
+      tags: [Tuner]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TunerCreate' }
+      responses:
+        "201":
+          description: Criado e refinamento iniciado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  request: { $ref: '#/components/schemas/TunerRequest' }
+                  draft: { $ref: '#/components/schemas/Product' }
+                required: [ok, request, draft]
+        "400":
+          description: Validação
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /api/tuner/requests/{id}:
+    get:
+      operationId: getTunerRequest
+      summary: Detalha um pedido tuner
+      tags: [Tuner]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Encontrado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  request: { $ref: '#/components/schemas/TunerRequest' }
+                required: [ok, request]
+        "404":
+          description: Não encontrado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /api/tuner/requests/{id}/action:
+    post:
+      operationId: tunerAction
+      summary: Ativa, mantém rascunho ou descarta
+      description: |
+        `activate` habilita produto e agenda (status ativado). `keep_draft` mantém desabilitado (aguardando_aprovacao). `discard` remove draft (status descartado). Sem confirmação, rascunho permanece desabilitado e não notifica.
+      tags: [Tuner]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                action:
+                  type: string
+                  enum: [activate, ativar, keep_draft, manter, discard, descartar]
+              required: [action]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  request: { $ref: '#/components/schemas/TunerRequest' }
+                required: [ok, request]
+        "400":
+          description: Action inválida
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        "404":
+          description: Não encontrado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /api/tuner/requests/{id}/refine:
+    post:
+      operationId: refineTunerRequest
+      summary: Re-dispara refinamento de um pedido
+      tags: [Tuner]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Refinamento re-iniciado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  request: { $ref: '#/components/schemas/TunerRequest' }
+                required: [ok, request]
+        "404":
+          description: Não encontrado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        "409":
+          description: Já em refinamento
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /api/tuner/models:
+    get:
+      operationId: listTunerModels
+      summary: Lista modelos disponíveis do provider LLM
+      description: |
+        Proxy para `{base_url}/models` com cache 5min. Provider `openrouter` usa `https://openrouter.ai/api/v1/models` (requer `Authorization: Bearer` + headers `HTTP-Referer`/`X-Title`), `opencode` usa `{base_url}/models` local (pode ser `ollama` sem chave), `mock` retorna lista sintética. Falha não bloqueia criação de pedido — UI usa fallback input livre. Suporta `?provider=&base_url=&force=1` para preview sem salvar.
+      tags: [Tuner]
+      parameters:
+        - name: provider
+          in: query
+          schema: { type: string, enum: [openrouter, opencode, mock] }
+          description: Override temporário para preview.
+        - name: base_url
+          in: query
+          schema: { type: string }
+          description: Override temporário de base_url.
+        - name: force
+          in: query
+          schema: { type: string, enum: ["1", "true", "yes"] }
+          description: Força refresh sem cache.
+      responses:
+        "200":
+          description: Lista de modelos
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  provider: { type: string }
+                  base_url: { type: string }
+                  models: { type: array, items: { type: object, additionalProperties: true } }
+                  cached: { type: boolean }
+                required: [ok, provider, base_url, models]
+        "502":
+          description: Falha ao contatar provider (retorna array vazio)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  error: { type: string }
+                  provider: { type: string }
+                  base_url: { type: string }
+                  models: { type: array, items: { type: object } }
+                required: [ok, error, provider, base_url, models]
+
+  /api/config/llm:
+    get:
+      operationId: getTunerLlmConfig
+      summary: Lê config LLM do tuner (mascarado)
+      description: |
+        Retorna `tuner_llm` efetivo (env > config.json) com `api_key` mascarada (`***xxxx`). `stored` é o valor persistido em `config.json`, `effective` é o resolvido com env. `env_override` lista chaves vindas de env.
+      tags: [Config]
+      responses:
+        "200":
+          description: Config LLM
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  llm: { $ref: '#/components/schemas/TunerLLMConfig' }
+                  effective: { $ref: '#/components/schemas/TunerLLMConfig' }
+                  stored: { $ref: '#/components/schemas/TunerLLMConfig' }
+                  env_override: { type: array, items: { type: string } }
+                required: [ok, llm]
+    put:
+      operationId: putTunerLlmConfig
+      summary: Atualiza config LLM do tuner
+      description: |
+        Persistido em `config.json` com `api_key` mascarada via `_mask_secret` como `telegram_token` (`app.py:784`). `GET` nunca expõe segredo, `PUT` com `_looks_masked` mantém valor armazenado. Valida `provider` openrouter|opencode|mock, `base_url` http(s), `model` 1..100, `api_key` opcional (opencode pode ser vazio).
+      tags: [Config]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/TunerLLMConfig'
+                - type: object
+                  properties:
+                    tuner_llm: { $ref: '#/components/schemas/TunerLLMConfig' }
+      responses:
+        "200":
+          description: Salvo
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  llm: { $ref: '#/components/schemas/TunerLLMConfig' }
+                  config: { $ref: '#/components/schemas/Config' }
+                required: [ok, llm, config]
+        "400":
+          description: Validação
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+components:
+  securitySchemes:
+    ApiKeyHeader:
+      type: apiKey
+      in: header
+      name: X-API-Token
+      description: |
+        Só exigida quando o servidor foi iniciado com a env `OLX_API_TOKEN`
+        (auth opt-in). Nesse modo, toda rota /api/* exige o header igual ao
+        token — exceto GET /api/health. Sem a env var, a API está aberta e o
+        header é ignorado. Rotas não-API (/ e /static/*) nunca são gated.
+
+  parameters:
+    ProductId:
+      name: pid
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/ProductId"
+      description: Id slugificado do produto (a-z0-9 e hífen).
+
+  schemas:
+    SimpleOk:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          example: true
+      required: [ok]
+
+    ErrorEnvelope:
+      type: object
+      description: |
+        Formato único de erro. Validação usa `errors[]` (um item por problema);
+        erros pontuais usam `error` (string). Ambos podem coexistir com campos
+        extras (job, hint, body).
+      properties:
+        ok:
+          type: boolean
+          enum: [false]
+        error:
+          type: string
+        errors:
+          type: array
+          items:
+            type: string
+      required: [ok]
+
+    ProductId:
+      type: string
+      pattern: "^[a-z0-9]+(-[a-z0-9]+)*$"
+      maxLength: 60
+      description: Slug minúsculo (a-z0-9 e hífen). Derivado do name se omitido; unicidade garantida com sufixo -2, -3...
+
+    Schedule:
+      type: object
+      description: Agendamento por produto. Timezone fixo America/Sao_Paulo. Produtos enabled=false não disparam mesmo com schedule.enabled=true.
+      properties:
+        enabled:
+          type: boolean
+          default: false
+        mode:
+          type: string
+          enum: [interval, cron]
+          default: interval
+        interval_minutes:
+          type: integer
+          minimum: 15
+          maximum: 10080
+          default: 360
+          description: Usado quando mode=interval (15min–7dias).
+        cron:
+          type: string
+          default: "0 */6 * * *"
+          description: Expressão crontab de 5 campos; obrigatória quando mode=cron.
+        jitter_minutes:
+          type: integer
+          minimum: 0
+          maximum: 60
+          default: 0
+        timezone:
+          type: string
+          enum: [America/Sao_Paulo]
+
+    Product:
+      type: object
+      description: Produto normalizado como retornado pela API (defaults já aplicados).
+      properties:
+        id:
+          $ref: "#/components/schemas/ProductId"
+        name:
+          type: string
+          maxLength: 80
+        queries:
+          type: array
+          maxItems: 50
+          items:
+            type: string
+            maxLength: 80
+          description: Termos de busca OLX; espaços viram '+' na URL.
+        pages:
+          type: integer
+          minimum: 1
+          maximum: 10
+          default: 2
+        search_url:
+          type: string
+          description: Template https:// com placeholders {query} e {page}.
+          example: "https://www.olx.com.br/brasil?q={query}&opst=2&page={page}"
+        playwright_only:
+          type: boolean
+          default: false
+          description: true = pula fetch curl e vai direto ao Playwright (mais lento, mais resistente).
+        min_price:
+          type: number
+          format: float
+          nullable: true
+          description: Preço mínimo absoluto em BRL (null = sem piso). NÃO é R$/TB.
+        max_price:
+          type: number
+          format: float
+          nullable: true
+          description: Preço máximo absoluto em BRL (null = sem teto). NÃO é R$/TB.
+        junk_pattern:
+          type: string
+          maxLength: 2000
+          description: Regex case-insensitive aplicada ao título; match = descartado.
+        exclude_keywords:
+          type: array
+          maxItems: 50
+          items:
+            type: string
+            maxLength: 40
+          description: Trechos/regex por título; qualquer hit = descartado (log [exclude]). Roda depois do junk_pattern.
+        include_pattern:
+          type: string
+          maxLength: 500
+          default: ""
+          description: 'Regex agnostica case-insensitive; se definida, titulo deve casar para ser considerado match (ex hd-6tb \b6\s*tb\b, pikmin \bpikmin\b). Roda apos preco, antes de junk/exclude.'
+        enabled:
+          type: boolean
+          default: true
+          description: false = excluído de scrapes gerais e não agenda.
+        draft:
+          type: boolean
+          default: false
+          description: true = rascunho criado pelo tuner (não notifica, só scrape explícito do draft). Promoção via tunerAction seta draft=false.
+        schedule:
+          $ref: "#/components/schemas/Schedule"
+      required:
+        - id
+        - name
+        - queries
+        - pages
+        - search_url
+        - playwright_only
+        - junk_pattern
+        - exclude_keywords
+        - enabled
+
+    ProductCreate:
+      type: object
+      description: Payload de criação. `name` e `queries` obrigatórios; demais opcionais (defaults aplicados). Aceita `id`.
+      required: [name, queries]
+      properties:
+        id:
+          $ref: "#/components/schemas/ProductId"
+        name:
+          type: string
+          minLength: 1
+          maxLength: 80
+        queries:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items:
+            type: string
+            minLength: 1
+            maxLength: 80
+        pages:
+          type: integer
+          minimum: 1
+          maximum: 10
+        search_url:
+          type: string
+          description: Deve começar com https:// e conter {query} e {page}.
+        playwright_only:
+          type: boolean
+        min_price:
+          type: number
+          nullable: true
+          minimum: 0
+          maximum: 1000000
+        max_price:
+          type: number
+          nullable: true
+          minimum: 0
+          maximum: 1000000
+        junk_pattern:
+          type: string
+          maxLength: 2000
+        exclude_keywords:
+          type: array
+          maxItems: 50
+          items:
+            type: string
+            maxLength: 40
+        include_pattern:
+          type: string
+          maxLength: 500
+          description: Regex agnóstica; título deve casar quando definida.
+        enabled:
+          type: boolean
+        draft:
+          type: boolean
+          description: true = rascunho (tuner). false = produto ativo.
+        schedule:
+          $ref: "#/components/schemas/Schedule"
+
+    ProductUpdate:
+      type: object
+      description: Payload de update (merge raso; tudo opcional). `id` pode ser renomeado (slugificado, 409 em colisão).
+      minProperties: 1
+      properties:
+        id:
+          $ref: "#/components/schemas/ProductId"
+        name:
+          type: string
+          minLength: 1
+          maxLength: 80
+        queries:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items:
+            type: string
+            maxLength: 80
+        pages:
+          type: integer
+          minimum: 1
+          maximum: 10
+        search_url:
+          type: string
+        playwright_only:
+          type: boolean
+        min_price:
+          type: number
+          nullable: true
+        max_price:
+          type: number
+          nullable: true
+        junk_pattern:
+          type: string
+          maxLength: 2000
+        exclude_keywords:
+          type: array
+          maxItems: 50
+          items:
+            type: string
+            maxLength: 40
+        include_pattern:
+          type: string
+          maxLength: 500
+        enabled:
+          type: boolean
+        draft:
+          type: boolean
+          description: true = rascunho (tuner). false = produto ativo.
+        schedule:
+          $ref: "#/components/schemas/Schedule"
+
+    TunerLLMConfig:
+      type: object
+      description: >-
+        Config LLM do tuner persistida em `config.json` com `api_key`
+        mascarada (`***xxxx`) como `telegram_token`. Env (`OLX_TUNER_LLM_*`)
+        tem precedencia sobre o arquivo. `model` tem default
+        `openai/gpt-4o-mini` quando omitido (útil para `provider: mock` ou env override).
+      properties:
+        provider:
+          type: string
+          enum: [openrouter, opencode, mock]
+          default: openrouter
+          description: openrouter=https://openrouter.ai/api/v1, opencode=http://127.0.0.1:4096/v1 ou custom, mock=heurística sem rede.
+        base_url:
+          type: string
+          format: uri
+          nullable: true
+          description: Base URL OpenAI-compatible. Default por provider quando vazio.
+          example: "https://openrouter.ai/api/v1"
+        model:
+          type: string
+          minLength: 1
+          maxLength: 100
+          default: openai/gpt-4o-mini
+          description: "Modelo a usar (openrouter: openai/gpt-4o-mini, anthropic/claude-3-haiku etc; opencode: lista de GET /api/tuner/models). Omitir usa o default do servidor."
+        api_key:
+          type: string
+          nullable: true
+          description: Mascarada (`***xxxx`) em toda resposta; enviar mascarada preserva valor armazenado. Opcional para opencode local.
+      required: [provider]
+
+    Config:
+      type: object
+      description: >-
+        Config global persistida. `telegram_token` e `tuner_llm.api_key` NUNCA voltam reais: respostas
+        trazem apenas `***` + últimos 4 chars. Reenviar o valor mascarado em
+        putConfig preserva o token armazenado (para trocar, envie o token novo).
+      properties:
+        products:
+          type: array
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/Product"
+        telegram_token:
+          type: string
+          nullable: true
+          description: Mascarado (`***xxxx`) em toda resposta; valor real só existe no servidor.
+        telegram_chat_id:
+          oneOf:
+            - type: string
+            - type: integer
+          nullable: true
+        notify_price_change_pct:
+          type: number
+          minimum: 0
+          maximum: 100
+          default: 5
+          description: "% de variação de preço para re-notificar deal já notificado."
+        tuner_llm:
+          $ref: "#/components/schemas/TunerLLMConfig"
+      required: [products]
+
+    ConfigPatch:
+      type: object
+      description: "Patch para putConfig. ATENÇÃO: presença de `products` substitui a lista inteira (máx 100, não-vazia). Campos ausentes ficam intactos."
+      properties:
+        products:
+          type: array
+          maxItems: 100
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/ProductCreate"
+        telegram_token:
+          type: string
+          nullable: true
+          description: >-
+            Token real para substituir o atual; se vier mascarado (`***xxxx`,
+            como retornado pelo getConfig), o valor armazenado é preservado.
+        telegram_chat_id:
+          oneOf:
+            - type: string
+            - type: integer
+          nullable: true
+        notify_price_change_pct:
+          type: number
+          minimum: 0
+          maximum: 100
+        tuner_llm:
+          $ref: "#/components/schemas/TunerLLMConfig"
+          description: Patch do LLM do tuner; `api_key` mascarada preserva valor armazenado.
+
+    Deal:
+      type: object
+      description: Anúncio coletado. Persistido no histórico; `notified` só existe na resposta de getDeals (derivado do registro de notificados).
+      properties:
+        id:
+          type: string
+          description: Ad id extraído da URL OLX.
+        title:
+          type: string
+        price:
+          type: number
+          nullable: true
+          description: Valor absoluto em BRL parseado do card (null se não parseável — esses nem chegam ao histórico).
+        url:
+          type: string
+          format: uri
+        query:
+          type: string
+          description: Termo de busca que encontrou o anúncio.
+        page:
+          type: integer
+          description: Página da busca onde apareceu.
+        product_id:
+          $ref: "#/components/schemas/ProductId"
+        product_name:
+          type: string
+        fetched_at:
+          type: string
+          format: date-time
+          description: ISO UTC do momento da coleta.
+        matched:
+          type: boolean
+          description: true = passou por preço+junk+exclude+dedupe.
+        discard_reason:
+          type: string
+          nullable: true
+          enum: [price, include, junk, exclude, dedupe]
+          description: Motivo do descarte quando matched=false; null quando matched=true. Ausente em deals pré-8 (tratar como matched legados).
+        notified:
+          type: boolean
+          description: Derivado — só em getDeals. true = já enviado ao Telegram.
+        ingestion_snapshot:
+          type: object
+          nullable: true
+          description: Snapshot dos filtros do product no momento da ingestão (quando #10 entregue); null para legados.
+          properties:
+            min_price: { type: number, nullable: true }
+            max_price: { type: number, nullable: true }
+            include_pattern: { type: string, nullable: true }
+            junk_pattern: { type: string, nullable: true }
+            exclude_keywords: { type: array, items: { type: string } }
+            at: { type: string, format: date-time }
+        matched_current:
+          type: boolean
+          nullable: true
+          description: Reavaliação com config vigente; só presente quando re-evaluate=1.
+        discard_reason_current:
+          type: string
+          nullable: true
+          enum: [price, include, junk, exclude, dedupe, orphan]
+          description: Motivo na view atual; prefixo exclude:<term> detalha termo.
+        status:
+          type: string
+          enum: [active, removed]
+          nullable: true
+          description: Lifecycle quando #9 entregue; ausente = active.
+        last_seen_at: { type: string, format: date-time, nullable: true }
+        first_seen_at: { type: string, format: date-time, nullable: true }
+        removed_at: { type: string, format: date-time, nullable: true }
+      required:
+        - id
+        - title
+        - url
+        - product_id
+        - fetched_at
+        - matched
+
+    ScrapeJobStub:
+      type: object
+      description: Resumo devolvido no disparo.
+      properties:
+        running:
+          type: boolean
+        params:
+          type: object
+          additionalProperties: true
+        started_at:
+          type: string
+          format: date-time
+
+    ScrapeJob:
+      type: object
+      description: Estado completo do job (getScrapeStatus).
+      properties:
+        running:
+          type: boolean
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        finished_at:
+          type: string
+          format: date-time
+          nullable: true
+        logs:
+          type: array
+          items:
+            type: string
+          description: Buffer do run (últimas ~800 linhas); omitido com ?logs=0.
+        progress:
+          type: object
+          description: Posição atual da varredura.
+          additionalProperties: true
+        results_count:
+          type: integer
+          description: Cards processados no run (preenchido ao final).
+        matched_count:
+          type: integer
+          description: Matches (passaram filtros) ao final.
+        error:
+          type: string
+          nullable: true
+        params:
+          type: object
+          additionalProperties: true
+          description: Parâmetros do disparo (product_ids/source/action).
+
+    CookiesStatus:
+      type: object
+      description: Forma varia conforme existência/leitura do cookie jar.
+      properties:
+        exists:
+          type: boolean
+        path:
+          type: string
+        mtime:
+          type: string
+          format: date-time
+        age_minutes:
+          type: number
+        cookies_count:
+          type: integer
+        cf_bm_expires:
+          type: number
+          nullable: true
+          description: Epoch de expiração do __cf_bm (Cloudflare); null se ausente.
+        size_bytes:
+          type: integer
+        error:
+          type: string
+          description: Presente apenas em falha de leitura.
+      required: [exists, path]
+
+    ScheduleStatus:
+      type: object
+      description: Linha por produto no getSchedulesStatus.
+      properties:
+        product_id:
+          $ref: "#/components/schemas/ProductId"
+        product_name:
+          type: string
+        enabled:
+          type: boolean
+          description: schedule.enabled.
+        mode:
+          type: string
+          enum: [interval, cron]
+        interval_minutes:
+          type: integer
+          nullable: true
+        cron:
+          type: string
+          nullable: true
+        jitter_minutes:
+          type: integer
+        timezone:
+          type: string
+        next_run:
+          type: string
+          nullable: true
+          description: Próxima execução segundo APScheduler (se ativo).
+        last_run:
+          type: string
+          nullable: true
+          description: ISO UTC do último run persistido.
+        last_status:
+          type: string
+          nullable: true
+          enum: [ok, error, null]
+        last_error:
+          type: string
+          nullable: true
+        last_matched:
+          type: integer
+          nullable: true
+        last_results:
+          type: integer
+          nullable: true
+        product_enabled:
+          type: boolean
+          description: enabled do produto (false ⇒ schedule não dispara).
+      required:
+        - product_id
+        - product_name
+        - enabled
+        - mode
+        - product_enabled
+
+    RunCounts:
+      type: object
+      properties:
+        total_cards:
+          type: integer
+          description: Cards brutos extraídos antes de qualquer filtro.
+        matched:
+          type: integer
+          description: Passaram por todos os filtros (matched=true).
+        discarded_price:
+          type: integer
+          description: Descartados por preço (null ou fora de faixa).
+        discarded_junk:
+          type: integer
+          description: Descartados por junk/include_pattern.
+        discarded_exclude:
+          type: integer
+          description: Descartados por exclude_keywords.
+        discarded_dedupe:
+          type: integer
+          description: Descartados por dedupe (id repetido).
+        notified_enviados:
+          type: integer
+        notified_pulados:
+          type: integer
+        notified_re_notificados:
+          type: integer
+      required: [total_cards, matched, discarded_price, discarded_junk, discarded_exclude, discarded_dedupe]
+
+    Run:
+      type: object
+      description: Registro de uma execução de scrape (Tier 1 auditável).
+      required: [id, started_at, finished_at, duration_ms, source, status, product_ids_requested, product_ids_scraped, counts]
+      properties:
+        id:
+          type: string
+          example: "20260827T143015-3f9a1c2e"
+          description: ISOcompact + hex8.
+        started_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: string
+          format: date-time
+        duration_ms:
+          type: integer
+          description: Duração em ms.
+        source:
+          type: string
+          enum: [manual, schedule, trigger, api, queue]
+          description: Origem do disparo.
+        status:
+          type: string
+          enum: [ok, error]
+        error:
+          type: string
+          nullable: true
+          description: Mensagem de erro (500 chars max) quando status=error.
+        product_ids_requested:
+          type: array
+          items:
+            type: string
+          description: Ids solicitados (ou todos habilitados se vazio).
+        product_ids_scraped:
+          type: array
+          items:
+            type: string
+          description: Ids efetivamente scrapeados.
+        counts:
+          $ref: "#/components/schemas/RunCounts"
+        per_product:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/RunCounts"
+          description: Breakdown por produto.
+
+    TunerBriefing:
+      type: object
+      required: [descricao, definicao, sementes]
+      properties:
+        descricao:
+          type: string
+          maxLength: 200
+          example: "starfox do switch"
+          description: Descrição vaga em linguagem natural (roteiro fixo).
+        definicao:
+          type: string
+          maxLength: 200
+          description: Definição em 1 frase (obrigatória).
+        obrigatorios:
+          anyOf:
+            - type: array
+              items: { type: string, maxLength: 40 }
+              maxItems: 10
+            - type: string
+          description: Termos que PRECISAM estar no título; vazio = sem obrigatórios (aceita string vírgula-separada por compat).
+        excludentes:
+          anyOf:
+            - type: array
+              items: { type: string, maxLength: 40 }
+              maxItems: 10
+            - type: string
+          description: Termos que NUNCA devem aparecer.
+        faixa:
+          type: object
+          nullable: true
+          properties:
+            min_price: { type: number, nullable: true, minimum: 0, maximum: 1000000 }
+            max_price: { type: number, nullable: true, minimum: 0, maximum: 1000000 }
+          description: Faixa de preço opcional.
+        sementes:
+          type: array
+          items: { type: string, maxLength: 80 }
+          minItems: 2
+          maxItems: 3
+          description: 2–3 termos que o usuário digitaria na OLX (cada 2..80 chars).
+        # compat legada flat
+        preco_min: { type: number, nullable: true, minimum: 0, maximum: 1000000 }
+        preco_max: { type: number, nullable: true, minimum: 0, maximum: 1000000 }
+        termos_obrigatorios: { type: string }
+        termos_a_excluir: { type: string }
+        queries: { type: array, items: { type: string } }
+        obrigatorios_str: { type: string, description: Alias string para obrigatorios }
+        excludentes_str: { type: string }
+
+    TunerLLM:
+      type: object
+      properties:
+        used:
+          type: boolean
+          description: true=LLM classificou, false=fallback heurístico (só com error preenchido)
+        provider:
+          type: string
+          nullable: true
+          example: "openai"
+        model:
+          type: string
+          nullable: true
+          example: "gpt-4o-mini"
+        latency_ms:
+          type: integer
+          nullable: true
+        prompt_tokens:
+          type: integer
+          nullable: true
+        completion_tokens:
+          type: integer
+          nullable: true
+        error:
+          type: string
+          nullable: true
+          description: Preenchido quando used=false
+
+    TunerIteration:
+      type: object
+      properties:
+        n: { type: integer }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time, nullable: true }
+        product_snapshot:
+          type: object
+          description: Snapshot do draft antes da iteração (queries/filtros).
+        deals_sample:
+          type: array
+          items: { $ref: '#/components/schemas/Deal' }
+          description: Amostra de deals matched avaliados (max 50).
+        classification:
+          type: object
+          properties:
+            tp: { type: integer }
+            fp: { type: integer }
+            precision: { type: number, minimum: 0, maximum: 1 }
+            examples:
+              type: object
+              properties:
+                tp: { type: array, items: { type: object } }
+                fp: { type: array, items: { type: object } }
+        llm: { $ref: '#/components/schemas/TunerLLM' }
+        refinement:
+          type: object
+          properties:
+            add_exclude: { type: array, items: { type: string } }
+            new_include_pattern: { type: string, nullable: true }
+            price_adjust: { type: object, additionalProperties: true }
+            reason: { type: string }
+        # compat legada
+        queries: { type: array, items: { type: string } }
+        include_pattern: { type: string, nullable: true }
+        exclude_keywords: { type: array, items: { type: string } }
+        min_price: { type: number, nullable: true }
+        max_price: { type: number, nullable: true }
+        total_cards: { type: integer }
+        matched: { type: integer }
+        precision: { type: number, minimum: 0, maximum: 1 }
+        tp_count: { type: integer }
+        fp_count: { type: integer }
+        examples_tp: { type: array, items: { type: object, additionalProperties: true } }
+        examples_fp: { type: array, items: { type: object, additionalProperties: true } }
+        proposed: { type: object, nullable: true, additionalProperties: true }
+        applied: { type: boolean }
+        error: { type: string, nullable: true }
+
+    TunerRequest:
+      type: object
+      properties:
+        id: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        status:
+          type: string
+          enum: [pendente, em_refinamento, aguardando_aprovacao, ativado, descartado]
+        briefing: { $ref: '#/components/schemas/TunerBriefing' }
+        draft_product_id: { type: string }
+        draft_product: { $ref: '#/components/schemas/Product' }
+        iterations:
+          type: array
+          items: { $ref: '#/components/schemas/TunerIteration' }
+        recommendation:
+          type: string
+          nullable: true
+          enum: [ativar, revisao_manual, null]
+        final_report:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: Briefing, evolucao, config_final, ofertas_finais, recomendacao.
+        final_config:
+          allOf:
+            - $ref: '#/components/schemas/Product'
+          nullable: true
+        history_deals_ref:
+          type: string
+          description: Referência ao product_id do draft para buscar deals.
+        error: { type: string, nullable: true }
+      required: [id, created_at, status, briefing, draft_product_id]
+
+    TunerCreate:
+      type: object
+      required: [descricao, definicao, sementes]
+      properties:
+        descricao:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: Descrição vaga (ex. starfox do switch).
+        definicao:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: Definição em 1 frase (obrigatória).
+        obrigatorios:
+          type: array
+          items: { type: string, maxLength: 40 }
+          maxItems: 10
+          description: Termos obrigatórios (cada 1..40 chars).
+        excludentes:
+          type: array
+          items: { type: string, maxLength: 40 }
+          maxItems: 10
+          description: Termos a excluir.
+        faixa:
+          type: object
+          properties:
+            min_price: { type: number, nullable: true, minimum: 0, maximum: 1000000 }
+            max_price: { type: number, nullable: true, minimum: 0, maximum: 1000000 }
+        preco_min:
+          type: number
+          nullable: true
+          minimum: 0
+          maximum: 1000000
+        preco_max:
+          type: number
+          nullable: true
+          minimum: 0
+          maximum: 1000000
+        sementes:
+          type: array
+          items: { type: string, minLength: 2, maxLength: 80 }
+          minItems: 2
+          maxItems: 3
+        # aliases flexíveis por compat
+        termos_obrigatorios: { type: string }
+        termos_a_excluir: { type: string }
+        queries: { type: array, items: { type: string } }
+        obrigatorios_str: { type: string }
+
+tags:
+  - name: System
+    description: Health e teste de notificação.
+  - name: Config
+    description: Config global (Telegram, threshold, lista de products).
+  - name: Products
+    description: CRUD de monitoramentos — caminho preferido para agentes.
+  - name: Deals
+    description: Histórico de anúncios e registro de notificações.
+  - name: Scrape
+    description: Execução de buscas, login anti-bot e cookies.
+  - name: Schedules
+    description: Agendamento por produto, fila e disparos manuais.
+  - name: Runs
+    description: Histórico por execução (Tier 1 sumário).
+  - name: Tuner
+    description: Cadastro assistido por IA — pedidos, rascunhos, refinamento e aprovação.

@@ -1,0 +1,504 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OLX Deals — Painel</title>
+<style>
+:root{--bg:#0f1217;--card:#171c23;--muted:#8a95a5;--fg:#e6edf3;--acc:#3b82f6;--acc2:#22c55e;--border:#242c37;--warn:#f59e0b;--err:#ef4444}
+*{box-sizing:border-box}
+body{margin:0;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--fg)}
+a{color:var(--acc)}
+header{position:sticky;top:0;z-index:10;background:rgba(15,18,23,.9);backdrop-filter:blur(8px);border-bottom:1px solid var(--border);padding:12px 18px;display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+header h1{margin:0;font-size:18px;font-weight:700;letter-spacing:.2px}
+header h1 span{color:var(--acc)}
+.badge{font-size:12px;padding:4px 8px;border-radius:99px;background:var(--card);border:1px solid var(--border);color:var(--muted)}
+.badge.ok{color:var(--acc2);border-color:rgba(34,197,94,.3)}
+.badge.warn{color:var(--warn)}
+.badge.err{color:var(--err)}
+nav{display:flex;gap:8px}
+.tab-btn{padding:8px 14px;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--muted);cursor:pointer;font-weight:600;font-size:13px}
+.tab-btn.active{background:var(--acc);color:white;border-color:var(--acc)}
+.wrap{max-width:1150px;margin:0 auto;padding:18px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px}
+.grid{display:grid;gap:16px}
+.grid2{grid-template-columns:1fr 1fr}
+@media(max-width:800px){.grid2{grid-template-columns:1fr}}
+label{font-size:12px;color:var(--muted);display:block;margin:10px 0 6px;font-weight:600;letter-spacing:.3px;text-transform:uppercase}
+input,textarea,select{width:100%;padding:10px 12px;border-radius:8px;border:1px solid var(--border);background:#0f1217;color:var(--fg);font-size:14px;outline:none}
+input:focus,textarea:focus,select:focus{border-color:var(--acc)}
+textarea{resize:vertical;min-height:80px}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.btn{padding:10px 16px;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--fg);cursor:pointer;font-weight:700;font-size:13px}
+.btn.primary{background:var(--acc);border-color:var(--acc);color:white}
+.btn.success{background:var(--acc2);border-color:var(--acc2);color:#07210f}
+.btn.danger{background:var(--err);border-color:var(--err);color:white}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn.small{padding:6px 10px;font-size:12px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{padding:10px 8px;border-bottom:1px solid var(--border);text-align:left}
+th{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.4px;white-space:nowrap}
+td{vertical-align:top}
+tr:hover td{background:rgba(255,255,255,.02)}
+.pill{font-size:11px;padding:2px 6px;border-radius:99px;background:#0f1217;border:1px solid var(--border)}
+.pill.match{background:rgba(34,197,94,.15);border-color:rgba(34,197,94,.3);color:var(--acc2)}
+.pill.off{background:rgba(239,68,68,.1);border-color:rgba(239,68,68,.3);color:var(--err)}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+.log{white-space:pre-wrap;word-break:break-word;background:#0b0e13;border:1px solid var(--border);border-radius:8px;padding:12px;max-height:360px;overflow:auto;font-size:12px;line-height:1.5}
+.kv{display:grid;grid-template-columns:140px 1fr;gap:8px;font-size:13px}
+.kv b{color:var(--muted);font-weight:600}
+.progress{height:8px;background:#0b0e13;border:1px solid var(--border);border-radius:99px;overflow:hidden}
+.progress i{display:block;height:100%;background:var(--acc);width:0%;transition:width .4s}
+.tag{display:inline-block;padding:2px 6px;border-radius:6px;background:rgba(59,130,246,.15);color:#93bbff;font-size:11px;margin:2px 4px 2px 0}
+.query-chip{display:inline-flex;align-items:center;gap:6px;background:#0f1217;border:1px solid var(--border);padding:6px 10px;border-radius:99px;font-size:13px;margin:4px}
+.query-chip button{border:none;background:transparent;color:var(--muted);cursor:pointer;font-weight:800}
+.muted{color:var(--muted)}
+.small{font-size:12px}
+hr{border:none;border-top:1px solid var(--border);margin:16px 0}
+.product-card{border:1px solid var(--border);border-radius:12px;background:#0f1217;padding:14px;display:flex;flex-direction:column;gap:8px}
+.product-card.disabled{opacity:.6}
+.product-head{display:flex;align-items:center;gap:10px;justify-content:space-between}
+.product-title{font-weight:700;font-size:15px}
+.product-id{font-size:11px;color:var(--muted)}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:50;padding:18px}
+.modal.open{display:flex}
+.modal-box{background:var(--card);border:1px solid var(--border);border-radius:12px;max-width:720px;width:100%;max-height:90vh;overflow:auto;padding:18px}
+</style>
+</head>
+<body>
+<header>
+  <h1>OLX <span>Deals</span></h1>
+  <span id="health" class="badge">carregando...</span>
+  <span id="cookiesBadge" class="badge">cookies: ...</span>
+  <div style="flex:1"></div>
+  <nav>
+    <button class="tab-btn active" data-tab="products">📦 Produtos</button>
+    <button class="tab-btn" data-tab="scrape">▶️ Buscar</button>
+    <button class="tab-btn" data-tab="results">🔍 Resultados <span id="resultCountBadge" style="opacity:.7"></span></button>
+    <button class="tab-btn" data-tab="schedules">⏰ Agendamentos <span id="schedCountBadge" style="opacity:.7"></span></button>
+    <button class="tab-btn" data-tab="tuner">🤖 Tuner <span id="tunerBadge" style="opacity:.7"></span></button>
+    <button class="tab-btn" data-tab="maintenance">🧹 Manutenção</button>
+  </nav>
+</header>
+
+<div class="wrap">
+  <!-- TAB PRODUCTS -->
+  <section id="tab-products" class="grid">
+    <div class="card">
+      <div class="row" style="justify-content:space-between">
+        <div>
+          <h3 style="margin:0">Produtos cadastrados</h3>
+          <p class="muted small" style="margin:4px 0 0">Cada produto tem suas próprias buscas e limite de preço. Salvo em <span class="mono">~/.olx/config.json</span> (campo <span class="mono">products</span>). Arquivo único de histórico <span class="mono">deals.json</span> com <span class="mono">product_id</span>.</p>
+        </div>
+        <div class="row">
+          <button class="btn small" onclick="loadProducts()">↻ Recarregar</button>
+          <button class="btn primary small" onclick="openProductModal(null)">+ Novo produto</button>
+        </div>
+      </div>
+      <div id="productsStatus" class="small muted" style="margin-top:8px"></div>
+      <div id="productsGrid" class="grid grid2" style="margin-top:14px"></div>
+      <div id="noProducts" class="small muted" style="text-align:center;padding:24px;display:none">Nenhum produto cadastrado.</div>
+    </div>
+
+    <div class="card">
+      <h3 style="margin:0 0 6px">Config global</h3>
+      <div class="grid grid2">
+        <div>
+          <label>Notificação Telegram</label>
+          <input id="tgToken" placeholder="123456789:AA..." class="mono">
+          <input id="tgChatId" placeholder="1234567890" style="margin-top:6px" class="mono">
+          <div class="row" style="margin-top:6px"><button class="btn small" onclick="testTelegram()">✈️ Testar Telegram</button><span id="tgTestRes" class="small muted"></span><button class="btn small" onclick="saveGlobalConfig()">💾 Salvar Telegram</button></div>
+          <div id="globalStatus" class="small muted" style="margin-top:6px"></div>
+        </div>
+        <div>
+          <label>Cookies Cloudflare</label>
+          <div id="cookiesInfo" class="small mono" style="background:#0b0e13;border:1px solid var(--border);padding:8px;border-radius:8px;white-space:pre-wrap"></div>
+          <div class="row" style="margin-top:8px"><button class="btn small" onclick="doLogin()">🔑 Capturar cookies</button><span class="small muted">~20s headless</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="card small muted">Dica: preço é filtro genérico por produto (ex: HD até R$900, iPhone até R$3500). Use <span class="mono">junk_pattern</span> para descartar títulos indesejados e <span class="mono">exclude_keywords</span> para remover termos das buscas — filtro local aplicado após a coleta, não altera a query enviada à OLX. Desative produtos sem removê-los.</div>
+  </section>
+
+  <!-- TAB SCRAPE -->
+  <section id="tab-scrape" class="grid" style="display:none">
+    <div class="card">
+      <h3 style="margin:0 0 6px">Forçar busca</h3>
+      <p class="muted small" style="margin:0">Selecione produtos para buscar agora. Por padrão busca todos os habilitados. Se ocupado, use <span class="mono">?queue=1</span> para enfileirar.</p>
+      <div class="grid grid2" style="margin-top:12px">
+        <div>
+          <label>Produtos</label>
+          <div id="scrapeProducts" class="small" style="border:1px solid var(--border);border-radius:8px;padding:10px;max-height:220px;overflow:auto;background:#0f1217"></div>
+          <div class="row" style="margin-top:6px"><button class="btn small" onclick="toggleAllScrape(true)">Todos</button><button class="btn small" onclick="toggleAllScrape(false)">Nenhum</button></div>
+          <label style="text-transform:none;letter-spacing:0;font-weight:500;color:var(--fg)"><input type="checkbox" id="ovPlaywright" style="width:auto"> Forçar Playwright nesta execução</label>
+          <label style="text-transform:none;letter-spacing:0;font-weight:500;color:var(--fg)"><input type="checkbox" id="ovQueue" style="width:auto"> Enfileirar se ocupado (fila)</label>
+          <div class="row" style="margin-top:12px">
+            <button id="btnScrape" class="btn primary" onclick="startScrape()">▶️ Buscar agora</button>
+            <span id="scrapeState" class="badge">ocioso</span>
+            <button id="btnClearQueue" class="btn small" onclick="clearQueue()" title="Limpar fila de agendamentos">🧹 Limpar fila</button>
+          </div>
+          <div id="scrapeQueueInfo" class="small muted" style="margin-top:6px"></div>
+          <div id="progressBox" style="margin-top:12px;display:none">
+            <div class="kv"><b>Produto</b> <span id="pProduct" class="mono"></span></div>
+            <div class="kv"><b>Query</b> <span id="pQuery" class="mono"></span></div>
+            <div class="kv"><b>Página</b> <span id="pPage" class="mono"></span></div>
+            <div class="progress" style="margin-top:6px"><i id="pBar"></i></div>
+            <div class="small muted" id="pStats" style="margin-top:6px"></div>
+          </div>
+        </div>
+        <div>
+          <label>Log ao vivo</label>
+          <div id="liveLog" class="log">— nenhuma busca em andamento —</div>
+          <div class="row" style="margin-top:6px"><button class="btn small" onclick="clearLog()">Limpar</button><button class="btn small" onclick="copyLog()">Copiar</button></div>
+        </div>
+      </div>
+    </div>
+    <div class="card small">
+      <b>Último resultado:</b> <span id="lastResult" class="muted">—</span>
+      <span style="float:right"><button class="btn small" onclick="switchTab('results')">Ver resultados →</button></span>
+    </div>
+  </section>
+
+  <!-- TAB RESULTS -->
+  <section id="tab-results" class="grid" style="display:none">
+    <div class="card">
+      <div class="row" style="justify-content:space-between">
+        <h3 style="margin:0">Resultados</h3>
+        <div class="row">
+          <button class="btn small" onclick="loadDeals()">↻ Atualizar</button>
+          <button class="btn small" onclick="exportJSON()">⬇️ JSON</button>
+          <button class="btn small" onclick="exportCSV()">⬇️ CSV</button>
+          <button class="btn small" onclick="clearNotified()" title="Apaga ~/.olx/notified.json — permite reenvio no próximo scrape">🧹 Limpar notificados</button>
+        </div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <select id="filterProduct" style="max-width:220px" onchange="loadDeals()"><option value="all">Todos os produtos</option></select>
+        <input id="qSearch" placeholder="Filtrar por título/url/id..." style="flex:1" oninput="debouncedLoad()">
+        <label style="display:flex;gap:6px;align-items:center;text-transform:none;letter-spacing:0;font-weight:600;color:var(--fg);margin:0"><input type="checkbox" id="matchedOnly" checked style="width:auto" onchange="loadDeals()"> Só matches</label>
+        <label style="display:flex;gap:6px;align-items:center;text-transform:none;letter-spacing:0;font-weight:600;color:var(--fg);margin:0"><input type="checkbox" id="hideNotified" style="width:auto" onchange="loadDeals()" title="Esconde anúncios já notificados no Telegram"> Só não notificados</label>
+        <input id="filterPriceMin" type="number" step="0.01" min="0" placeholder="R$ min" style="max-width:110px" title="Preço mínimo ad-hoc (view)" oninput="debouncedLoad()">
+        <input id="filterPriceMax" type="number" step="0.01" min="0" placeholder="R$ max" style="max-width:110px" title="Preço máximo ad-hoc (view)" oninput="debouncedLoad()">
+        <select id="sortBy" onchange="loadDeals()" style="max-width:160px"><option value="fetched_at">Data</option><option value="price">Preço</option><option value="title">Título</option><option value="product">Produto</option></select>
+        <select id="sortOrder" onchange="loadDeals()" style="max-width:120px"><option value="desc">↓ desc</option><option value="asc">↑ asc</option></select>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <label style="display:flex;gap:6px;align-items:center;text-transform:none;letter-spacing:0;font-weight:600;color:var(--fg);margin:0" title="Reaplica filtros vigentes sobre título/preço sem persistir; permite ver não-aderentes"><input type="checkbox" id="reEvaluate" style="width:auto" onchange="loadDeals()"> Ver com filtros atuais</label>
+        <select id="adherentFilter" style="max-width:160px" onchange="loadDeals()" title="Só com Ver com filtros atuais"><option value="all">Todos (aderentes + não)</option><option value="1">Só aderentes</option><option value="0">Só não-aderentes</option></select>
+        <span id="adherentBadge" class="badge warn" style="display:none">não-aderente</span>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <span id="dealStats" class="small muted"></span>
+        <div style="flex:1"></div>
+        <span class="small muted">Auto-refresh 30s</span>
+      </div>
+      <div style="overflow:auto;margin-top:10px;border:1px solid var(--border);border-radius:8px">
+        <table id="dealsTable">
+          <thead><tr><th>Produto</th><th>Título</th><th>Preço</th><th>Query</th><th>Data</th><th>Link</th></tr></thead>
+          <tbody id="dealsBody"><tr><td colspan="6" class="muted" style="text-align:center;padding:24px">carregando...</td></tr></tbody>
+        </table>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button class="btn small" onclick="loadMore()">Carregar mais</button>
+        <span id="limitInfo" class="small muted"></span>
+      </div>
+    </div>
+  </section>
+
+  <!-- TAB SCHEDULES (Fase 2) -->
+  <section id="tab-schedules" class="grid" style="display:none">
+    <div class="card">
+      <div class="row" style="justify-content:space-between">
+        <h3 style="margin:0">⏰ Agendamentos por produto (Fase 2)</h3>
+        <div class="row">
+          <button class="btn small" onclick="loadSchedulesAndRender()">↻ Atualizar</button>
+          <button class="btn small" onclick="clearQueue()" title="Limpar fila">🧹 Limpar fila</button>
+        </div>
+      </div>
+      <p class="small muted" style="margin:6px 0 0">Lista completa de agendamentos: intervalo <span class="mono">15m–7d</span>, cron <span class="mono">5 campos</span>, jitter <span class="mono">0–60min</span>, fila sequencial e <span class="mono">last_run</span> persistido em <span class="mono">~/.olx/schedules.json</span>. Fuso fixo <span class="mono">America/Sao_Paulo</span>.</p>
+      <div id="schedStatusHeader" class="small muted" style="margin-top:8px"></div>
+      <div style="overflow:auto;margin-top:10px;border:1px solid var(--border);border-radius:8px">
+        <table>
+          <thead><tr><th>Produto</th><th>Agendamento</th><th>Próx</th><th>Última</th><th>Status</th><th>Ações</th></tr></thead>
+          <tbody id="schedBody"><tr><td colspan="6" class="muted" style="text-align:center;padding:24px">carregando...</td></tr></tbody>
+        </table>
+      </div>
+      <div id="schedQueueInfo" class="small muted" style="margin-top:8px"></div>
+      <div class="small muted" style="margin-top:8px">Concorrência: 1 busca por vez (job global + fila). Se ocupado, trigger enfileira (<span class="mono">coalesce</span> + <span class="mono">misfire_grace 10min</span>). Jitter evita fingerprint Cloudflare. Intervalo mínimo 15min — menor que 1h aumenta risco de ban.</div>
+    </div>
+    <div class="card small">
+      <b>Cron exemplos:</b> <span class="mono">0 */6 * * *</span> (6h), <span class="mono">0 9,19 * * *</span> (9h+19h), <span class="mono">*/30 * * * *</span> (30min), <span class="mono">0 7 * * 1</span> (seg 7h). Validação via <span class="mono">CronTrigger</span> (APScheduler). <a href="https://crontab.guru/" target="_blank" rel="noopener">crontab.guru</a>
+    </div>
+  </section>
+
+  <!-- TAB TUNER (Backlog #12) -->
+  <section id="tab-tuner" class="grid" style="display:none">
+    <div class="card" id="tunerLlmCard">
+      <div class="row" style="justify-content:space-between">
+        <h3 style="margin:0">⚙️ Configuração LLM (critério 8)</h3>
+        <div class="row">
+          <button class="btn small" onclick="loadTunerLlmConfig()">↻ Carregar</button>
+          <button class="btn primary small" onclick="saveTunerLlmConfig()">💾 Salvar</button>
+        </div>
+      </div>
+      <p class="small muted" style="margin:6px 0 0">Provider OpenAI-compatible. <span class="mono">openrouter</span> = <span class="mono">https://openrouter.ai/api/v1</span> (requer API key), <span class="mono">opencode</span> = <span class="mono">http://127.0.0.1:4096/v1</span> ou URL custom (ollama local sem chave), <span class="mono">mock</span> para CI sem rede. Env <span class="mono">OLX_TUNER_LLM_*</span> tem precedência sobre arquivo.</p>
+      <div class="grid grid2" style="margin-top:12px">
+        <div>
+          <label>Provider</label>
+          <select id="tunerProvider" onchange="onTunerProviderChange()">
+            <option value="openrouter">openrouter (OpenRouter)</option>
+            <option value="opencode">opencode (local/ollama)</option>
+            <option value="mock">mock (CI)</option>
+          </select>
+          <label style="margin-top:8px">Base URL</label>
+          <input id="tunerBaseUrl" placeholder="https://openrouter.ai/api/v1 ou http://127.0.0.1:4096/v1">
+          <label style="margin-top:8px">API Key</label>
+          <input id="tunerApiKey" type="password" placeholder="sk-... (***xxxx se já salvo)">
+        </div>
+        <div>
+          <label>Modelo <span class="small muted">(filtrável, fallback input livre)</span></label>
+          <div class="row" style="gap:6px">
+            <select id="tunerModelSelect" style="flex:1" onchange="onTunerModelSelect()"><option value="">— carregue modelos —</option></select>
+            <button class="btn small" onclick="loadTunerModels()">↻ Modelos</button>
+          </div>
+          <input id="tunerModelInput" placeholder="ex: openai/gpt-4o-mini ou llama3.2" style="margin-top:6px">
+          <input id="tunerModelFilter" placeholder="filtrar modelos..." style="margin-top:6px" oninput="filterTunerModels()">
+          <div id="tunerLlmStatus" class="small muted" style="margin-top:8px"></div>
+          <div id="tunerEnvBadge" class="small muted" style="margin-top:4px"></div>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="row" style="justify-content:space-between">
+        <h3 style="margin:0">🤖 Cadastro assistido por IA (Tuner)</h3>
+        <div class="row">
+          <button class="btn small" onclick="loadTunerRequests()">↻ Atualizar</button>
+          <button class="btn primary small" onclick="openTunerModal()">+ Novo pedido</button>
+        </div>
+      </div>
+      <p class="small muted" style="margin:6px 0 0">Descreva o produto em linguagem natural (ex.: "starfox do switch", "hd 8tb para NAS"). O sistema cria um rascunho desabilitado (<span class="mono">draft=true</span>, sem notificar Telegram) e refina automaticamente via coletas reais + avaliação de precisão (max 4 iterações). Ativação exige confirmação explícita.</p>
+      <div class="row" style="margin-top:10px">
+        <select id="tunerStatusFilter" style="max-width:200px" onchange="loadTunerRequests()"><option value="all">Todos estados</option><option value="pendente">Pendente</option><option value="em_refinamento">Em refinamento</option><option value="aguardando_aprovacao">Aguardando aprovação</option><option value="ativado">Ativado</option><option value="descartado">Descartado</option></select>
+        <input id="tunerQ" placeholder="Filtrar por descrição/id..." style="flex:1" oninput="debouncedTunerLoad()">
+        <select id="tunerSort" style="max-width:160px" onchange="loadTunerRequests()"><option value="created_at">Criação</option><option value="updated_at">Atualização</option><option value="status">Estado</option></select>
+        <select id="tunerOrder" style="max-width:120px" onchange="loadTunerRequests()"><option value="desc">↓ desc</option><option value="asc">↑ asc</option></select>
+      </div>
+      <div id="tunerStats" class="small muted" style="margin-top:8px"></div>
+      <div style="overflow:auto;margin-top:10px;border:1px solid var(--border);border-radius:8px">
+        <table>
+          <thead><tr><th>Pedido</th><th>Rascunho</th><th>Estado</th><th>Iterações</th><th>Precisão</th><th>LLM</th><th>Ações</th></tr></thead>
+          <tbody id="tunerBody"><tr><td colspan="7" class="muted" style="text-align:center;padding:24px">carregando...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="card">
+      <h3 style="margin:0 0 6px">Detalhe do pedido</h3>
+      <div id="tunerDetail" class="small muted">Selecione um pedido na tabela para ver briefing, evolução por iteração e relatório final.</div>
+    </div>
+  </section>
+
+  <!-- TAB MAINTENANCE (Fase 4 Expurgo) -->
+  <section id="tab-maintenance" class="grid" style="display:none">
+    <div class="card">
+      <div class="row" style="justify-content:space-between">
+        <h3 style="margin:0">🧹 Expurgo seguro (Fase 4)</h3>
+        <div class="row">
+          <button class="btn small" onclick="refreshPurgePreview()">↻ Atualizar contadores</button>
+        </div>
+      </div>
+      <p class="small muted" style="margin:6px 0 0">Lista ofertas não-aderentes/órfãs/removidas com preview dry-run, backup e confirmação. View re-avaliada usa <span class="mono">re-evaluate=1</span> sobre <span class="mono">title/price</span> com <span class="mono">config.json</span> vigente. Órfãos = product_id sem entrada em config.</p>
+      <div class="grid grid2" style="margin-top:12px">
+        <div>
+          <label>Produtos (multiselect, vazio = todos)</label>
+          <div id="purgeProducts" class="small" style="border:1px solid var(--border);border-radius:8px;padding:10px;max-height:160px;overflow:auto;background:#0f1217"></div>
+          <label>Motivos (checkboxes, vazio = todos)</label>
+          <div id="purgeReasons" class="small" style="border:1px solid var(--border);border-radius:8px;padding:8px;background:#0f1217">
+            <label style="text-transform:none"><input type="checkbox" value="orphan" style="width:auto"> orphan</label>
+            <label style="text-transform:none"><input type="checkbox" value="include" style="width:auto"> include</label>
+            <label style="text-transform:none"><input type="checkbox" value="junk" style="width:auto"> junk</label>
+            <label style="text-transform:none"><input type="checkbox" value="exclude" style="width:auto"> exclude</label>
+            <label style="text-transform:none"><input type="checkbox" value="price" style="width:auto"> price</label>
+          </div>
+          <label style="text-transform:none"><input type="checkbox" id="purgeIncludeOrphans" style="width:auto"> Incluir órfãos na execução (sem checkbox, órfãos só via product_ids explícito)</label>
+          <div class="grid grid2" style="margin-top:8px">
+            <div>
+              <label>Status</label>
+              <select id="purgeStatus"><option value="all">Todos</option><option value="active">Só ativos</option><option value="removed">Só removidos</option></select>
+            </div>
+            <div>
+              <label>Older than (ISO ou Nd)</label>
+              <input id="purgeOlderThan" placeholder="ex: 2026-07-27T00:00:00Z ou 30d">
+            </div>
+          </div>
+          <div class="row" style="margin-top:10px">
+            <button class="btn primary" onclick="doPurgePreview()">🔍 Pré-visualizar (dry-run)</button>
+            <button class="btn danger" onclick="doPurgeExec()">🗑️ Expurgar selecionados (cria backup)</button>
+          </div>
+          <div id="purgeStatusMsg" class="small muted" style="margin-top:8px"></div>
+        </div>
+        <div>
+          <label>Preview (dry-run)</label>
+          <div id="purgePreview" class="small mono" style="background:#0b0e13;border:1px solid var(--border);padding:8px;border-radius:8px;white-space:pre-wrap;max-height:360px;overflow:auto">— clique em Pré-visualizar —</div>
+          <label>Candidatos (primeiros 20)</label>
+          <div style="overflow:auto;max-height:260px;border:1px solid var(--border);border-radius:8px">
+            <table><thead><tr><th>Produto</th><th>Título</th><th>Motivo</th></tr></thead><tbody id="purgeCandidatesBody"><tr><td colspan="3" class="muted" style="text-align:center;padding:12px">—</td></tr></tbody></table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<!-- Modal tuner -->
+<div id="tunerModal" class="modal" onclick="if(event.target===this) closeTunerModal()">
+  <div class="modal-box">
+    <div class="row" style="justify-content:space-between">
+      <h3 style="margin:0">Novo pedido — Tuner</h3>
+      <button class="btn small" onclick="closeTunerModal()">✕</button>
+    </div>
+    <div id="tunerStatus" class="small muted" style="margin-top:6px"></div>
+    <p class="small muted">Roteiro fixo (genérico, agnóstico a categoria). Preencha o mínimo: descrição + sementes. Demais refinam precisão.</p>
+    <label>Descrição vaga (o que quer achar?) *</label>
+    <input id="tunerDesc" placeholder='ex: starfox do switch, hd 8tb para NAS'>
+    <label>Definição em 1 frase (produto exato)</label>
+    <input id="tunerDefinicao" placeholder='ex: Star Fox para Nintendo Switch, jogo físico'>
+    <label>Termos obrigatórios (vírgula separada) — precisam estar no título</label>
+    <input id="tunerObrig" placeholder='ex: starfox, switch'>
+    <label>Termos a excluir (vírgula) — NUNCA quer ver</label>
+    <input id="tunerExcl" placeholder='ex: wii u, revista, boneco, wii'>
+    <div class="grid grid2">
+      <div>
+        <label>Preço mínimo (R$, opcional)</label>
+        <input id="tunerPrecoMin" type="number" step="0.01" min="0" placeholder="ex: 100">
+      </div>
+      <div>
+        <label>Preço máximo (R$, opcional)</label>
+        <input id="tunerPrecoMax" type="number" step="0.01" min="0" placeholder="ex: 500">
+      </div>
+    </div>
+    <label>Sementes de busca — 2-3 termos que digitaria na OLX *</label>
+    <div id="tunerSementesChips" style="margin-bottom:8px"></div>
+    <div class="row">
+      <input id="tunerSementesInput" placeholder="ex: starfox switch" style="flex:1" onkeydown="if(event.key==='Enter'){addTunerSemente(); event.preventDefault();}">
+      <button class="btn" onclick="addTunerSemente()">+ Adicionar</button>
+    </div>
+    <div class="small muted">O sistema cria rascunho <span class="mono">draft=true</span> desabilitado (sem Telegram/agendamento) e inicia refinamento iterativo (max 4). Ver progresso na aba Tuner.</div>
+    <div class="row" style="margin-top:14px;justify-content:flex-end">
+      <button class="btn" onclick="closeTunerModal()">Cancelar</button>
+      <button class="btn primary" onclick="submitTuner()">🤖 Criar pedido e refinar</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal produto -->
+<div id="productModal" class="modal" onclick="if(event.target===this) closeProductModal()">
+  <div class="modal-box">
+    <div class="row" style="justify-content:space-between">
+      <h3 id="modalTitle" style="margin:0">Novo produto</h3>
+      <button class="btn small" onclick="closeProductModal()">✕</button>
+    </div>
+    <div id="modalStatus" class="small muted" style="margin-top:6px"></div>
+    <label>Nome *</label>
+    <input id="mName" placeholder="ex: iPhone 13 128GB, HD 8TB, Placa RTX 4060">
+    <label>ID (slug, opcional — auto)</label>
+    <input id="mId" placeholder="ex: iphone-13-128gb" class="mono">
+    <label>Queries * (termos de busca, um por chip)</label>
+    <div id="mChips" style="margin-bottom:8px"></div>
+    <div class="row">
+      <input id="mNewQuery" placeholder="ex: iphone 13 128gb" style="flex:1" onkeydown="if(event.key==='Enter'){addMQuery(); event.preventDefault();}">
+      <button class="btn" onclick="addMQuery()">+ Adicionar</button>
+    </div>
+    <details style="margin-top:8px"><summary class="small muted" style="cursor:pointer">Edição em lote (linha ou vírgula)</summary>
+      <textarea id="mBulk" rows="3" placeholder="iphone 13, iphone 13 128gb"></textarea>
+      <div class="row" style="margin-top:6px"><button class="btn small" onclick="applyMBulk()">Aplicar lote</button></div>
+    </details>
+    <label>Excluir termos das buscas (opcional)</label>
+    <div id="mExcludeChips" style="margin-bottom:8px"></div>
+    <div class="row">
+      <input id="mNewExclude" placeholder="ex: GB, TB, dock, suporte" style="flex:1" onkeydown="if(event.key==='Enter'){addMExclude(); event.preventDefault();}">
+      <button class="btn" onclick="addMExclude()">+ Adicionar</button>
+    </div>
+    <div class="small muted">Descarta anúncios cujo título contém o termo — filtro local pós-coleta, não altera a busca enviada à OLX. Ex: "GB" remove "HD 500GB" mas não "Teclado RGB". Máx 50 termos de 40 chars.</div>
+    <div class="grid grid2">
+      <div>
+        <label>Preço mínimo (R$, opcional)</label>
+        <input id="mMinPrice" type="number" step="0.01" min="0" placeholder="ex: 2000">
+      </div>
+      <div>
+        <label>Preço máximo (R$, opcional) *</label>
+        <input id="mMaxPrice" type="number" step="0.01" min="0" placeholder="ex: 3500">
+      </div>
+    </div>
+    <div class="small muted">Deixe vazio para sem limite. Ao menos um limite é recomendado. Filtro é: <span class="mono">min ≤ preço ≤ max</span>.</div>
+    <div class="grid grid2">
+      <div>
+        <label>Páginas por query</label>
+        <select id="mPages"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option><option value="8">8</option><option value="10">10</option></select>
+      </div>
+      <div>
+        <label>Ativo</label>
+        <label style="text-transform:none"><input type="checkbox" id="mEnabled" checked style="width:auto"> Habilitado para buscas</label>
+        <label style="text-transform:none;margin-top:6px"><input type="checkbox" id="mPlaywright" style="width:auto"> Sempre usar Playwright</label>
+      </div>
+    </div>
+    <label>URL de busca (template)</label>
+    <input id="mSearchUrl" class="mono">
+    <div class="small muted">Deve conter <span class="mono">{query}</span> e <span class="mono">{page}</span>. Padrão nacional <span class="mono">/brasil?q=...</span></div>
+    <label>Filtro anti-lixo (regex, opcional)</label>
+    <textarea id="mJunk" rows="2" class="mono" placeholder="\b(vitrine|mostruario|quebrado)\b"></textarea>
+    <hr>
+    <label>⏰ Agendamento automático — Fase 2 (interval + cron + jitter + fila + last_run)</label>
+    <label style="text-transform:none"><input type="checkbox" id="mScheduleEnabled" style="width:auto" onchange="toggleScheduleFields()"> Ativar busca automática para este produto</label>
+    <div id="scheduleFields" style="margin-top:8px; display:none">
+      <div class="grid grid2">
+        <div>
+          <label style="text-transform:none;letter-spacing:0;font-weight:600;color:var(--fg)">Modo</label>
+          <select id="mScheduleMode" onchange="toggleScheduleFields()">
+            <option value="interval">Intervalo (minutos)</option>
+            <option value="cron">Cron (expressão avançada)</option>
+          </select>
+        </div>
+        <div>
+          <label style="text-transform:none;letter-spacing:0;font-weight:600;color:var(--fg)">Jitter (min aleatório 0–60)</label>
+          <input id="mScheduleJitter" type="number" min="0" max="60" value="0" placeholder="0">
+          <div class="small muted">Evita fingerprint (ex.: 5 = ±5min)</div>
+        </div>
+      </div>
+      <div id="scheduleIntervalGroup">
+        <label style="text-transform:none;letter-spacing:0;font-weight:600;color:var(--fg)">Intervalo</label>
+        <select id="mScheduleInterval" onchange="toggleScheduleFields()">
+          <option value="15">a cada 15 min</option>
+          <option value="30">a cada 30 min</option>
+          <option value="60">a cada 1 hora</option>
+          <option value="120">a cada 2 horas</option>
+          <option value="180">a cada 3 horas</option>
+          <option value="360" selected>a cada 6 horas</option>
+          <option value="720">a cada 12 horas</option>
+          <option value="1440">a cada 24 horas</option>
+          <option value="10080">a cada 7 dias</option>
+        </select>
+      </div>
+      <div id="scheduleCronGroup" style="display:none">
+        <label style="text-transform:none;letter-spacing:0;font-weight:600;color:var(--fg)">Expressão cron (5 campos)</label>
+        <input id="mScheduleCron" class="mono" placeholder="0 */6 * * *">
+        <div class="small muted">Fuso America/Sao_Paulo. Exemplos: <span class="mono">0 9,19 * * *</span> (9h e 19h), <span class="mono">*/30 * * * *</span> (30min). <a href="https://crontab.guru/" target="_blank" rel="noopener">crontab.guru</a></div>
+        <div id="cronValidation" class="small" style="margin-top:4px"></div>
+      </div>
+      <div class="small muted" style="margin-top:8px">Fuso fixo <span class="mono">America/Sao_Paulo</span> · <span id="scheduleHint" class="mono small"></span></div>
+      <div class="small muted" style="margin-top:4px">Concorrência sequencial (fila). Intervalo mínimo 15min. Persistência <span class="mono">last_run</span> em <span class="mono">schedules.json</span> sobrevive a reboot 00:37 UTC.</div>
+    </div>
+    <div class="row" style="margin-top:14px;justify-content:flex-end">
+      <button class="btn" onclick="closeProductModal()">Cancelar</button>
+      <button class="btn primary" onclick="saveProduct()">💾 Salvar</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/js/api.js"></script>
+<script src="/static/js/products.js"></script>
+<script src="/static/js/schedules.js"></script>
+<script src="/static/js/scrape.js"></script>
+<script src="/static/js/deals.js"></script>
+<script src="/static/js/tuner.js"></script>
+
+</body>
+</html>
